@@ -34,6 +34,10 @@ let manualConvertEnabled = true
 let doubleShiftWindow = 0.35     // окно двойного тапа Shift, сек
 let minAutoWordLen = 3           // короче — автоисправление не трогает
 let maxWordLen = 24              // длиннее — не буферизуем
+// Слова, которые автоисправление никогда не трогает (без учёта регистра).
+// Сокращения СПЛОШНЫМИ ЗАГЛАВНЫМИ (HD, СКЗИ, НДС...) пропускаются автоматически.
+let userExceptions: Set<String> = []
+
 // Здесь автоисправление молчит (двойной Shift работает везде)
 let excludedBundleIDs: Set<String> = [
     "com.apple.Terminal", "com.googlecode.iterm2", "dev.warp.Warp-Stable",
@@ -249,6 +253,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let bid = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
            excludedBundleIDs.contains(bid) { return }
         let typed = translate(word, via: cur)
+        // Аббревиатуры: слово сплошными заглавными (HD, СКЗИ) — не трогаем
+        if typed.rangeOfCharacter(from: .letters) != nil, typed == typed.uppercased() { return }
+        if userExceptions.contains(typed.lowercased()) { return }
         let converted = translate(word, via: other)
         guard converted.count >= minAutoWordLen,
               converted.allSatisfy({ $0.isLetter }),

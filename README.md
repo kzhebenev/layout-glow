@@ -33,6 +33,7 @@
 - В терминалах (Terminal, iTerm2, Warp, kitty, Ghostty, WezTerm) автоисправление молчит; список — `excludedBundleIDs` в `main.swift`. Двойной Shift работает везде.
 - Автоисправление срабатывает только на пробеле; через Enter/Tab/стрелки/клик мышью слово не трогается.
 - Слова короче 3 букв не исправляются.
+- Аббревиатуры сплошными заглавными (HD, СКЗИ, НДС) не трогаются; для особых случаев есть список `userExceptions` в `main.swift`.
 
 Выключить: `autoCorrectEnabled = false` (авто) и/или `manualConvertEnabled = false` (двойной Shift) в начале `main.swift`, затем `./install.sh`.
 
