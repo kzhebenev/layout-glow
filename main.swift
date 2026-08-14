@@ -1,6 +1,7 @@
 import Cocoa
 import Carbon
 import ServiceManagement
+import IOKit.hid
 
 // Настройки: цвет и яркость свечения для каждой раскладки.
 // Ключ — суффикс InputSourceID (com.apple.keylayout.<...>).
@@ -20,10 +21,19 @@ let glowHeight: CGFloat = 48     // высота полосы свечения �
 let flashAlpha: CGFloat = 0.95   // вспышка в момент переключения
 let pillLifetime = 1.0           // сколько секунд висит плашка RU/EN
 
-func currentLayout() -> String {
+// Быстрое переключение по Fn (нужно разрешение Input Monitoring,
+// а системную «Press 🌐 key to» поставить в «Do Nothing»)
+let fnSwitchEnabled = true
+let maxFnTap = 0.6               // дольше держал — не считаем тапом
+
+func currentLayoutFullID() -> String {
     guard let src = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
           let ptr = TISGetInputSourceProperty(src, kTISPropertyInputSourceID) else { return "" }
-    let id = Unmanaged<CFString>.fromOpaque(ptr).takeUnretainedValue() as String
+    return Unmanaged<CFString>.fromOpaque(ptr).takeUnretainedValue() as String
+}
+
+func currentLayout() -> String {
+    let id = currentLayoutFullID()
     return id.components(separatedBy: ".").last ?? id
 }
 
@@ -40,6 +50,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var pillWindow: NSWindow?
     var pillTimer: Timer?
     var lastLayout = ""
+
+    var eventTap: CFMachPort?
+    var fnDown = false
+    var fnUsedAsModifier = false
+    var fnDownAt: TimeInterval = 0
+    var accessRequested = false
 
     func applicationDidFinishLaunching(_ note: Notification) {
         // Автозапуск при входе: регистрируем себя как Login Item (только из .app-бандла)
@@ -66,6 +82,85 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let now = currentLayout()
             if now != self.lastLayout { self.apply(layout: now, animated: true) }
         }
+
+        if fnSwitchEnabled { startFnTap() }
+    }
+
+    // MARK: Быстрое переключение по Fn
+
+    func startFnTap() {
+        let mask: CGEventMask = (1 << CGEventType.flagsChanged.rawValue) | (1 << CGEventType.keyDown.rawValue)
+        let callback: CGEventTapCallBack = { _, type, event, refcon in
+            let me = Unmanaged<AppDelegate>.fromOpaque(refcon!).takeUnretainedValue()
+            me.handleTapEvent(type: type, event: event)
+            return Unmanaged.passUnretained(event)
+        }
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly,
+            eventsOfInterest: mask, callback: callback,
+            userInfo: Unmanaged.passUnretained(self).toOpaque())
+        else {
+            // Нет разрешения Input Monitoring: просим один раз и ждём, пока выдадут
+            if !accessRequested {
+                accessRequested = true
+                IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.startFnTap() }
+            return
+        }
+        eventTap = tap
+        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+    }
+
+    func handleTapEvent(type: CGEventType, event: CGEvent) {
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
+            return
+        }
+        let keycode = event.getIntegerValueField(.keyboardEventKeycode)
+        switch type {
+        case .flagsChanged where keycode == 63:  // сама клавиша Fn/Globe
+            let pressed = event.flags.contains(.maskSecondaryFn)
+            if pressed && !fnDown {
+                fnDown = true
+                fnUsedAsModifier = false
+                fnDownAt = ProcessInfo.processInfo.systemUptime
+            } else if !pressed && fnDown {
+                fnDown = false
+                let held = ProcessInfo.processInfo.systemUptime - fnDownAt
+                if !fnUsedAsModifier && held < maxFnTap {
+                    DispatchQueue.main.async { self.toggleLayout() }
+                }
+            }
+        case .flagsChanged, .keyDown:
+            // Любая другая клавиша, пока Fn зажат — это комбинация, не тап
+            if fnDown { fnUsedAsModifier = true }
+        default:
+            break
+        }
+    }
+
+    func toggleLayout() {
+        // Пока системный «Press Globe key to» не в «Do Nothing», не дублируем систему
+        if let v = CFPreferencesCopyAppValue("AppleFnUsageType" as CFString,
+                                             "com.apple.HIToolbox" as CFString) as? Int, v != 0 {
+            return
+        }
+        let filter = [kTISPropertyInputSourceCategory as String: kTISCategoryKeyboardInputSource as String,
+                      kTISPropertyInputSourceIsSelectCapable as String: true] as CFDictionary
+        guard let cfList = TISCreateInputSourceList(filter, false)?.takeRetainedValue() else { return }
+        let list = cfList as NSArray as! [TISInputSource]
+        guard list.count > 1 else { return }
+
+        func sourceID(_ s: TISInputSource) -> String {
+            guard let p = TISGetInputSourceProperty(s, kTISPropertyInputSourceID) else { return "" }
+            return Unmanaged<CFString>.fromOpaque(p).takeUnretainedValue() as String
+        }
+        let current = currentLayoutFullID()
+        let index = list.firstIndex(where: { sourceID($0) == current }) ?? 0
+        TISSelectInputSource(list[(index + 1) % list.count])
     }
 
     func buildGlowWindows() {
