@@ -22,8 +22,8 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
     <key>CFBundleName</key><string>LayoutGlow</string>
     <key>CFBundleExecutable</key><string>LayoutGlow</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>1.2.1</string>
-    <key>CFBundleVersion</key><string>4</string>
+    <key>CFBundleShortVersionString</key><string>2.0</string>
+    <key>CFBundleVersion</key><string>5</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>LSUIElement</key><true/>
     <key>NSHighResolutionCapable</key><true/>
@@ -31,7 +31,21 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 </plist>
 EOF
 
-codesign --force -s - "$APP"
+# Подпись постоянным самоподписанным сертификатом: без неё каждая пересборка
+# меняет хеш бинарника и macOS сбрасывает выданные разрешения.
+KEYCHAIN="$HOME/Library/Keychains/layoutglow.keychain-db"
+CN="LayoutGlow Self-Signed"
+if [ ! -f "$KEYCHAIN" ] && [ -x "$DIR/setup-signing.sh" ]; then
+    "$DIR/setup-signing.sh"
+fi
+if security find-identity -v -p codesigning "$KEYCHAIN" 2>/dev/null | grep -q "$CN"; then
+    PASSFILE="$HOME/Library/Application Support/LayoutGlow/signing.pass"
+    [ -f "$PASSFILE" ] && security unlock-keychain -p "$(cat "$PASSFILE")" "$KEYCHAIN"
+    codesign --force --keychain "$KEYCHAIN" -s "$CN" "$APP"
+else
+    echo "Внимание: подписываю ad-hoc — разрешения придётся выдавать заново после каждой пересборки."
+    codesign --force -s - "$APP"
+fi
 
 echo "Собираю DMG..."
 STAGE="$BUILD/dmg-root"
