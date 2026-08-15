@@ -164,6 +164,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var snippetsFile = SnippetFile(name: "snippets.txt", header: "", defaults: defaultSnippets,
                                    directory: dictionaryDirectory(iCloud: Settings.shared.iCloudSync))
     var onboardingWindow: NSWindow?
+    var shortcutsWindow: NSWindow?
 
     // Диагностика
     var keysSeen = 0
@@ -186,10 +187,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             name: NSNotification.Name("AppleSelectedInputSourcesChangedNotification"),
             object: nil, suspensionBehavior: .deliverImmediately)
 
-        // Отладочный триггер: показать тестовую точку без открытия меню
+        // Отладочные триггеры: показать ярлык или окно справки без меню
         DistributedNotificationCenter.default().addObserver(
             self, selector: #selector(testDot),
             name: NSNotification.Name("ru.devkz.layoutglow.testdot"),
+            object: nil, suspensionBehavior: .deliverImmediately)
+        DistributedNotificationCenter.default().addObserver(
+            self, selector: #selector(showShortcuts),
+            name: NSNotification.Name("ru.devkz.layoutglow.shortcuts"),
             object: nil, suspensionBehavior: .deliverImmediately)
 
         NotificationCenter.default.addObserver(
@@ -662,6 +667,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                              action: #selector(checkUpdatesManually), keyEquivalent: "")
         upd.target = self
         menu.addItem(upd)
+        let shortcuts = NSMenuItem(title: "Справка по сочетаниям…", action: #selector(showShortcuts), keyEquivalent: "")
+        shortcuts.target = self
+        menu.addItem(shortcuts)
         let help = NSMenuItem(title: "Окно настройки…", action: #selector(showOnboardingFromMenu), keyEquivalent: "")
         help.target = self
         menu.addItem(help)
@@ -1130,6 +1138,96 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         showPill(text: wanted ? "iCloud" : "локально", color: .systemGray)
     }
 
+    // MARK: Окно справки
+
+    @objc func showShortcuts() {
+        if let w = shortcutsWindow {
+            w.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        let rows: [(String, String)] = [
+            ("Тап Fn", "Переключить раскладку мгновенно"),
+            ("Двойной Shift", "Конвертировать выделенное; без выделения — слово, которое набираешь или набрал последним"),
+            ("Двойной Shift после исправления", "Откатить его и занести слово в исключения навсегда"),
+            ("Cmd+Option+минус", "Конвертировать текущую строку целиком"),
+            ("Cmd+Option+0", "Развернуть набранный ключ в текст из словаря вставок"),
+            ("Cmd+Option+1...9", "Вставить строку из слота"),
+            ("Пробел, запятая, «!», «?»", "Проверяют набранное слово и исправляют раскладку сами"),
+        ]
+        let slots = (1...9).compactMap { n -> (String, String)? in
+            guard let v = snippetsFile.value(for: String(n)) else { return nil }
+            return ("Cmd+Option+\(n)", v.count > 46 ? String(v.prefix(46)) + "…" : v)
+        }
+        let keys = snippetsFile.items
+            .filter { Int($0.key) == nil }
+            .sorted { $0.key < $1.key }
+            .map { ("«\($0.key)» + Cmd+Option+0", $0.value.count > 40 ? String($0.value.prefix(40)) + "…" : $0.value) }
+
+        let rowHeight: CGFloat = 34
+        let size = NSSize(width: 620, height: CGFloat(rows.count + slots.count + keys.count) * rowHeight + 150)
+        let w = NSWindow(contentRect: NSRect(origin: .zero, size: size),
+                         styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        w.title = "Сочетания LayoutGlow"
+        w.center()
+        w.isReleasedWhenClosed = false
+        w.level = .floating
+
+        let content = NSView(frame: NSRect(origin: .zero, size: size))
+        var y = size.height - 56
+
+        func header(_ text: String) {
+            let l = NSTextField(labelWithString: text)
+            l.frame = NSRect(x: 24, y: y, width: size.width - 48, height: 22)
+            l.font = .systemFont(ofSize: 14, weight: .semibold)
+            content.addSubview(l)
+            y -= 30
+        }
+        func row(_ key: String, _ text: String) {
+            let k = NSTextField(labelWithString: key)
+            k.frame = NSRect(x: 24, y: y, width: 210, height: 30)
+            k.font = .monospacedSystemFont(ofSize: 12, weight: .semibold)
+            k.lineBreakMode = .byTruncatingTail
+            content.addSubview(k)
+
+            let v = NSTextField(wrappingLabelWithString: text)
+            v.frame = NSRect(x: 244, y: y - 4, width: size.width - 268, height: 34)
+            v.font = .systemFont(ofSize: 12)
+            v.isEditable = false
+            v.drawsBackground = false
+            content.addSubview(v)
+            y -= rowHeight
+        }
+
+        header("Жесты и сочетания")
+        for (k, v) in rows { row(k, v) }
+        if !slots.isEmpty || !keys.isEmpty {
+            y -= 6
+            header("Ваши вставки")
+            for (k, v) in slots + keys { row(k, v) }
+        }
+
+        let edit = NSButton(title: "Открыть словарь вставок", target: self, action: #selector(openSnippets))
+        edit.frame = NSRect(x: 24, y: 16, width: 220, height: 28)
+        edit.bezelStyle = .rounded
+        content.addSubview(edit)
+
+        let close = NSButton(title: "Закрыть", target: self, action: #selector(closeShortcuts))
+        close.frame = NSRect(x: size.width - 110, y: 16, width: 86, height: 28)
+        close.bezelStyle = .rounded
+        content.addSubview(close)
+
+        w.contentView = content
+        w.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        shortcutsWindow = w
+    }
+
+    @objc func closeShortcuts() {
+        shortcutsWindow?.close()
+        shortcutsWindow = nil
+    }
+
     // MARK: Окно первого запуска
 
     @objc func showOnboardingFromMenu() { showOnboarding(activate: true) }
@@ -1177,6 +1275,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         label("3. Клавиатура: «Press Globe key to» поставить в «Do Nothing», иначе тап Fn останется медленным",
               y: size.height - 250, size: 12)
         button("Открыть настройки клавиатуры", y: size.height - 282, action: #selector(openKeyboardSettings))
+
+        let shortcutsButton = NSButton(title: "Справка по сочетаниям", target: self, action: #selector(showShortcuts))
+        shortcutsButton.frame = NSRect(x: 24, y: 16, width: 190, height: 28)
+        shortcutsButton.bezelStyle = .rounded
+        content.addSubview(shortcutsButton)
 
         let done = NSButton(title: "Готово", target: self, action: #selector(finishOnboarding))
         done.frame = NSRect(x: size.width - 110, y: 16, width: 86, height: 28)
