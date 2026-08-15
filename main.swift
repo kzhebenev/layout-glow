@@ -60,6 +60,8 @@ final class Settings {
             "appLayouts": [String: String](),
             "iCloudSync": false,
             "onboarded": false,
+            "perFieldLayout": false,
+            "fieldLayouts": [String: String](),
         ])
     }
 
@@ -102,6 +104,14 @@ final class Settings {
     var onboarded: Bool {
         get { d.bool(forKey: "onboarded") }
         set { d.set(newValue, forKey: "onboarded") }
+    }
+    var perFieldLayout: Bool {
+        get { d.bool(forKey: "perFieldLayout") }
+        set { d.set(newValue, forKey: "perFieldLayout") }
+    }
+    var fieldLayouts: [String: String] {
+        get { d.dictionary(forKey: "fieldLayouts") as? [String: String] ?? [:] }
+        set { d.set(newValue, forKey: "fieldLayouts") }
     }
 
     func isExcluded(_ bundleID: String?) -> Bool {
@@ -156,6 +166,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     var hotKeyRefs: [EventHotKeyRef?] = []
     var manualAXEnabled = Set<pid_t>()
+    var hotkeyHandlerInstalled = false
 
     var exceptionsFile = WordFile(name: "exceptions.txt", header: exceptionsHeader,
                                   directory: dictionaryDirectory(iCloud: Settings.shared.iCloudSync))
@@ -163,6 +174,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                 directory: dictionaryDirectory(iCloud: Settings.shared.iCloudSync))
     var snippetsFile = SnippetFile(name: "snippets.txt", header: "", defaults: defaultSnippets,
                                    directory: dictionaryDirectory(iCloud: Settings.shared.iCloudSync))
+    var rulesFile = SnippetFile(name: "layout-rules.txt", header: "", defaults: defaultLayoutRules,
+                                directory: dictionaryDirectory(iCloud: Settings.shared.iCloudSync))
+    var hotkeysFile = SnippetFile(name: "hotkeys.txt", header: "", defaults: defaultHotkeys,
+                                  directory: dictionaryDirectory(iCloud: Settings.shared.iCloudSync))
+    var lastFieldKey = ""
     var onboardingWindow: NSWindow?
     var shortcutsWindow: NSWindow?
 
@@ -222,6 +238,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.exceptionsFile.reload()
             self.commandsFile.reload()
             self.snippetsFile.reload()
+            self.rulesFile.reload()
+            if self.hotkeysFile.reloadIfChanged() { self.registerSlotHotkeys() }
+            if Settings.shared.perFieldLayout { self.checkFocusedField() }
         }
 
         startTap()
@@ -270,6 +289,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let now = currentLayout()
         if now != lastLayout { apply(layout: now, animated: true) }
         rememberLayout()
+        rememberFieldLayout()
     }
 
     func currentStyle() -> Style {
@@ -494,13 +514,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func restoreLayout(for app: NSRunningApplication) {
-        guard Settings.shared.perAppLayout, let bid = app.bundleIdentifier,
-              let wanted = Settings.shared.appLayouts[bid], wanted != currentLayoutFullID(),
+        guard let bid = app.bundleIdentifier else { return }
+        // Правило из файла сильнее запомненного: «в терминале всегда EN»
+        if let lang = rulesFile.value(for: bid), let source = source(forLanguage: lang) {
+            select(source, why: "правило для «\(appName(for: bid))»: \(lang)")
+            return
+        }
+        guard Settings.shared.perAppLayout,
+              let wanted = Settings.shared.appLayouts[bid],
               let source = layout(withID: wanted) else { return }
+        select(source, why: "раскладка для «\(appName(for: bid))»")
+    }
+
+    func source(forLanguage code: String) -> TISInputSource? {
+        let wanted = code.trimmingCharacters(in: .whitespaces).lowercased()
+        return enabledLayouts().first { sourceLang($0).lowercased().hasPrefix(wanted) }
+    }
+
+    func select(_ source: TISInputSource, why: String) {
+        guard sourceID(source) != currentLayoutFullID() else { return }
         restoringLayout = true
         TISSelectInputSource(source)
-        log("раскладка для «\(appName(for: bid))»: \(wanted.components(separatedBy: ".").last ?? wanted)")
+        log(why)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.restoringLayout = false }
+    }
+
+    // MARK: Раскладка по типу поля (адресная строка, поиск, текст)
+
+    // Ключ вида «com.apple.Safari:AXTextField:AXSearchField»
+    func focusedFieldKey() -> String? {
+        guard let element = focusedElement(), let bid = frontApp?.bundleIdentifier else { return nil }
+        func attribute(_ name: String) -> String? {
+            var ref: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(element, name as CFString, &ref) == .success else { return nil }
+            return ref as? String
+        }
+        guard let role = attribute(kAXRoleAttribute as String) else { return nil }
+        let subrole = attribute(kAXSubroleAttribute as String) ?? ""
+        return "\(bid):\(role)\(subrole.isEmpty ? "" : ":" + subrole)"
+    }
+
+    func checkFocusedField() {
+        guard let key = focusedFieldKey(), key != lastFieldKey else { return }
+        lastFieldKey = key
+        guard let wanted = Settings.shared.fieldLayouts[key], let source = layout(withID: wanted) else { return }
+        select(source, why: "раскладка для поля \(key.components(separatedBy: ":").dropFirst().joined(separator: ":"))")
+    }
+
+    func rememberFieldLayout() {
+        guard Settings.shared.perFieldLayout, !restoringLayout, let key = focusedFieldKey() else { return }
+        var map = Settings.shared.fieldLayouts
+        map[key] = currentLayoutFullID()
+        Settings.shared.fieldLayouts = map
+        lastFieldKey = key
     }
 
     // MARK: Диагностика
@@ -524,6 +590,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         раскладка: \(lastLayout), Caps Lock: \(capsOn ? "включён" : "выключен")
         активное приложение: \(frontApp?.bundleIdentifier ?? "—")
         словари: исключений \(exceptionsFile.words.count), команд \(commandsFile.words.count), вставок \(snippetsFile.items.count)
+        правил раскладки: \(rulesFile.items.count), сочетаний занято: \(hotKeyRefs.count)
+        раскладка по типу поля: \(Settings.shared.perFieldLayout ? "вкл" : "выкл"), поле: \(lastFieldKey.isEmpty ? "—" : lastFieldKey)
         раскладка по приложениям: \(Settings.shared.perAppLayout ? "вкл" : "выкл")
 
         события:
@@ -588,6 +656,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         toggle("Своя раскладка для каждого приложения", s.perAppLayout, #selector(togglePerApp))
         toggle("Подсветка Caps Lock", s.capsGlow, #selector(toggleCaps))
         toggle("Ярлык раскладки у курсора", s.caretDot, #selector(toggleCaret))
+        toggle("Раскладка по типу поля (адресная строка, поиск)", s.perFieldLayout, #selector(togglePerField))
         toggle("Словари в iCloud (общие для всех маков)", s.iCloudSync, #selector(toggleICloud))
 
         menu.addItem(.separator())
@@ -622,6 +691,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         fileItem("Исключения (\(exceptionsFile.words.count))…", #selector(openExceptions))
         fileItem("Системные команды (\(commandsFile.words.count))…", #selector(openCommands))
         fileItem("Вставки (\(snippetsFile.items.count))…", #selector(openSnippets))
+        fileItem("Правила раскладок (\(rulesFile.items.count))…", #selector(openRules))
+        fileItem("Сочетания клавиш…", #selector(openHotkeys))
         dicts.addItem(.separator())
         let reload = NSMenuItem(title: "Перечитать словари", action: #selector(reloadDictionaries), keyEquivalent: "")
         reload.target = self
@@ -685,6 +756,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     @objc func toggleCaps() { Settings.shared.capsGlow.toggle(); refreshGlow(animated: false) }
     @objc func toggleCaret() { Settings.shared.caretDot.toggle() }
+    @objc func togglePerField() {
+        Settings.shared.perFieldLayout.toggle()
+        lastFieldKey = ""
+        if Settings.shared.perFieldLayout { rememberFieldLayout() }
+    }
     @objc func toggleFrontApp() {
         guard let bid = frontApp?.bundleIdentifier else { return }
         Settings.shared.setExcluded(bid, !Settings.shared.isExcluded(bid))
@@ -696,10 +772,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func openExceptions() { NSWorkspace.shared.open(exceptionsFile.url) }
     @objc func openCommands() { NSWorkspace.shared.open(commandsFile.url) }
     @objc func openSnippets() { NSWorkspace.shared.open(snippetsFile.url) }
+    @objc func openRules() { NSWorkspace.shared.open(rulesFile.url) }
+    @objc func openHotkeys() { NSWorkspace.shared.open(hotkeysFile.url) }
     @objc func reloadDictionaries() {
         exceptionsFile.reload(force: true)
         commandsFile.reload(force: true)
         snippetsFile.reload(force: true)
+        rulesFile.reload(force: true)
+        hotkeysFile.reload(force: true)
+        registerSlotHotkeys()
         showPill(text: "словари", color: .systemGray)
     }
     @objc func testDot() {
@@ -1108,6 +1189,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return true
     }
 
+    // Абзац целиком: от пустой строки до пустой строки вокруг курсора
+    @objc func convertParagraph() {
+        guard let element = focusedElement() else {
+            log("абзац: нет фокуса ввода")
+            return
+        }
+        var valueRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &valueRef) == .success,
+              let text = valueRef as? String, !text.isEmpty else {
+            log("абзац: «\(frontApp?.localizedName ?? "?")» не отдаёт текст")
+            return
+        }
+        var rangeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success,
+              let rv = rangeRef, CFGetTypeID(rv) == AXValueGetTypeID() else {
+            log("абзац: не удалось узнать положение курсора")
+            return
+        }
+        var caretRange = CFRange()
+        AXValueGetValue(rv as! AXValue, .cfRange, &caretRange)
+
+        let ns = text as NSString
+        let caret = min(max(0, caretRange.location), ns.length)
+        let before = ns.range(of: "\n\n", options: .backwards, range: NSRange(location: 0, length: caret))
+        let start = before.location == NSNotFound ? 0 : before.location + 2
+        let after = ns.range(of: "\n\n", options: [],
+                             range: NSRange(location: caret, length: ns.length - caret))
+        let end = after.location == NSNotFound ? ns.length : after.location
+        guard end > start else { log("абзац: пусто"); return }
+
+        let paragraph = ns.substring(with: NSRange(location: start, length: end - start))
+        guard let (converted, target) = convertText(paragraph), converted != paragraph else {
+            log("абзац: нечего менять")
+            return
+        }
+        var selection = CFRange(location: start, length: end - start)
+        guard let selValue = AXValueCreate(.cfRange, &selection),
+              AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, selValue) == .success,
+              AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString,
+                                           converted as CFTypeRef) == .success else {
+            log("абзац: приложение не даёт заменить текст")
+            return
+        }
+        TISSelectInputSource(target)
+        log("абзац: \(paragraph.count) симв. сконвертировано")
+    }
+
     // MARK: Словари в iCloud
 
     @objc func toggleICloud() {
@@ -1118,7 +1246,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let from = dictionaryDirectory(iCloud: Settings.shared.iCloudSync)
         let to = dictionaryDirectory(iCloud: wanted)
-        for name in ["exceptions.txt", "commands.txt", "snippets.txt"] {
+        for name in ["exceptions.txt", "commands.txt", "snippets.txt", "layout-rules.txt", "hotkeys.txt"] {
             let src = from.appendingPathComponent(name)
             let dst = to.appendingPathComponent(name)
             guard FileManager.default.fileExists(atPath: src.path) else { continue }
@@ -1134,6 +1262,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         commandsFile = WordFile(name: "commands.txt", header: commandsHeader,
                                 defaults: defaultCommands, directory: to)
         snippetsFile = SnippetFile(name: "snippets.txt", header: "", defaults: defaultSnippets, directory: to)
+        rulesFile = SnippetFile(name: "layout-rules.txt", header: "", defaults: defaultLayoutRules, directory: to)
+        hotkeysFile = SnippetFile(name: "hotkeys.txt", header: "", defaults: defaultHotkeys, directory: to)
+        registerSlotHotkeys()
         log("словари: \(wanted ? "в iCloud" : "локально") (\(to.path))")
         showPill(text: wanted ? "iCloud" : "локально", color: .systemGray)
     }
@@ -1146,23 +1277,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NSApp.activate(ignoringOtherApps: true)
             return
         }
+        func combo(_ action: String, _ fallback: String) -> String {
+            (hotkeysFile.value(for: action) ?? fallback).replacingOccurrences(of: "+", with: " + ")
+        }
         let rows: [(String, String)] = [
             ("Тап Fn", "Переключить раскладку мгновенно"),
             ("Двойной Shift", "Конвертировать выделенное; без выделения — слово, которое набираешь или набрал последним"),
             ("Двойной Shift после исправления", "Откатить его и занести слово в исключения навсегда"),
-            ("Cmd+Option+минус", "Конвертировать текущую строку целиком"),
-            ("Cmd+Option+0", "Развернуть набранный ключ в текст из словаря вставок"),
-            ("Cmd+Option+1...9", "Вставить строку из слота"),
+            (combo("строка", "cmd+opt+-"), "Конвертировать текущую строку до курсора"),
+            (combo("абзац", "cmd+opt+="), "Конвертировать абзац целиком"),
+            (combo("ключ", "cmd+opt+0"), "Развернуть набранный ключ в текст из словаря вставок"),
             ("Пробел, запятая, «!», «?»", "Проверяют набранное слово и исправляют раскладку сами"),
         ]
         let slots = (1...9).compactMap { n -> (String, String)? in
             guard let v = snippetsFile.value(for: String(n)) else { return nil }
-            return ("Cmd+Option+\(n)", v.count > 46 ? String(v.prefix(46)) + "…" : v)
+            let key = (hotkeysFile.value(for: "слот-\(n)") ?? "cmd+opt+\(n)").replacingOccurrences(of: "+", with: " + ")
+            return (key, v.count > 46 ? String(v.prefix(46)) + "…" : v)
         }
         let keys = snippetsFile.items
             .filter { Int($0.key) == nil }
             .sorted { $0.key < $1.key }
-            .map { ("«\($0.key)» + Cmd+Option+0", $0.value.count > 40 ? String($0.value.prefix(40)) + "…" : $0.value) }
+            .map { ("«\($0.key)» + \(combo("ключ", "cmd+opt+0"))",
+                    $0.value.count > 40 ? String($0.value.prefix(40)) + "…" : $0.value) }
 
         let rowHeight: CGFloat = 34
         let size = NSSize(width: 620, height: CGFloat(rows.count + slots.count + keys.count) * rowHeight + 150)
@@ -1374,35 +1510,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Горячие клавиши слотов (Cmd+Option+1...9)
 
     func registerSlotHotkeys() {
-        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, event, userData in
-            guard let event, let userData else { return noErr }
-            var hkID = EventHotKeyID()
-            GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
-                              nil, MemoryLayout<EventHotKeyID>.size, nil, &hkID)
-            let me = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
-            DispatchQueue.main.async {
-                switch hkID.id {
-                case 0: me.expandSnippet()
-                case 10: me.convertLine()
-                default: me.insertSlot(Int(hkID.id))
-                }
-            }
-            return noErr
-        }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), nil)
+        for ref in hotKeyRefs { if let ref { UnregisterEventHotKey(ref) } }
+        hotKeyRefs.removeAll()
 
-        // Cmd+Option+0 разворачивает набранный ключ, Cmd+Option+1...9 — слоты
-        var failed: [String] = []
-        let digitKeycodes: [UInt32] = [expandKeycode, 18, 19, 20, 21, 23, 22, 26, 28, 25, lineKeycode]
-        for (index, keycode) in digitKeycodes.enumerated() {
-            var ref: EventHotKeyRef?
-            let id = EventHotKeyID(signature: OSType(0x4C474C4F), id: UInt32(index))
-            let status = RegisterEventHotKey(keycode, UInt32(cmdKey | optionKey), id,
-                                             GetApplicationEventTarget(), 0, &ref)
-            if status != noErr { failed.append("\(index)") }
-            hotKeyRefs.append(ref)
+        if !hotkeyHandlerInstalled {
+            hotkeyHandlerInstalled = true
+            var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+            InstallEventHandler(GetApplicationEventTarget(), { _, event, userData in
+                guard let event, let userData else { return noErr }
+                var hkID = EventHotKeyID()
+                GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                                  nil, MemoryLayout<EventHotKeyID>.size, nil, &hkID)
+                let me = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
+                DispatchQueue.main.async {
+                    switch hkID.id {
+                    case 100: me.convertLine()
+                    case 101: me.convertParagraph()
+                    case 102: me.expandSnippet()
+                    default: me.insertSlot(Int(hkID.id))
+                    }
+                }
+                return noErr
+            }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), nil)
         }
-        if !failed.isEmpty { log("не удалось занять Cmd+Option+: \(failed.joined(separator: ", "))") }
+
+        // Действия и их номера; клавиши берём из hotkeys.txt
+        var actions: [(String, UInt32)] = [("строка", 100), ("абзац", 101), ("ключ", 102)]
+        for n in 1...9 { actions.append(("слот-\(n)", UInt32(n))) }
+
+        var failed: [String] = []
+        for (name, id) in actions {
+            guard let text = hotkeysFile.value(for: name) else { continue }
+            guard let hotkey = parseHotkey(text) else {
+                failed.append("\(name): не разобрать «\(text)»")
+                continue
+            }
+            var ref: EventHotKeyRef?
+            let status = RegisterEventHotKey(hotkey.keycode, hotkey.modifiers,
+                                             EventHotKeyID(signature: OSType(0x4C474C4F), id: id),
+                                             GetApplicationEventTarget(), 0, &ref)
+            if status == noErr { hotKeyRefs.append(ref) } else { failed.append("\(name): занято (\(text))") }
+        }
+        if !failed.isEmpty { log("сочетания: \(failed.joined(separator: "; "))") }
     }
 
     // MARK: Обновления

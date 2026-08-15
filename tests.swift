@@ -1,4 +1,5 @@
 import AppKit
+import Carbon
 
 // Тесты логики автоисправления и словарей: ./run-tests.sh
 
@@ -81,6 +82,22 @@ check(!isPureWord("па4оль"), "цифра — не чистое слово")
 check(boundaryChars.contains(","), "запятая — граница слова")
 check(!boundaryChars.contains("."), "точка не граница: ломала бы пути и домены")
 check(identifierChars.contains("@"), "собака — часть адреса")
+
+// Разбор сочетаний клавиш
+check(parseHotkey("cmd+opt+-") == Hotkey(keycode: 27, modifiers: UInt32(cmdKey | optionKey)), "сочетание: cmd+opt+минус")
+check(parseHotkey("cmd+opt+=") == Hotkey(keycode: 24, modifiers: UInt32(cmdKey | optionKey)), "сочетание: cmd+opt+равно")
+check(parseHotkey("CMD + Option + 5") == Hotkey(keycode: 23, modifiers: UInt32(cmdKey | optionKey)), "сочетание: регистр и пробелы")
+check(parseHotkey("ctrl+shift+f1") == Hotkey(keycode: 122, modifiers: UInt32(controlKey | shiftKey)), "сочетание: ctrl+shift+F1")
+check(parseHotkey("cmd+опт+пробел") == nil, "сочетание: неизвестный модификатор отвергается")
+check(parseHotkey("q") == nil, "сочетание: без модификаторов отвергается")
+check(parseHotkey("cmd+щщщ") == nil, "сочетание: неизвестная клавиша отвергается")
+
+// Правила раскладок и сочетаний по умолчанию разбираются
+let rules = SnippetFile.parse(defaultLayoutRules.joined(separator: "\n"))
+check(rules["com.apple.terminal"] == "en", "правила: терминал на английском")
+let hotkeys = SnippetFile.parse(defaultHotkeys.joined(separator: "\n"))
+check(hotkeys.count == 12, "сочетания: 12 действий по умолчанию")
+check(hotkeys.allSatisfy { parseHotkey($0.value) != nil }, "сочетания: все значения разбираются")
 
 // Словарь вставок
 let parsed = SnippetFile.parse("""

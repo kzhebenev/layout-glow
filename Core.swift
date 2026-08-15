@@ -320,6 +320,13 @@ final class SnippetFile {
     }
 
     func value(for key: String) -> String? { items[key.lowercased()] }
+
+    // true, если файл изменился с прошлой проверки (нужно перерегистрировать сочетания)
+    func reloadIfChanged() -> Bool {
+        let before = items
+        reload()
+        return before != items
+    }
 }
 
 // MARK: - Списки по умолчанию
@@ -360,3 +367,70 @@ let defaultSnippets = [
 
 let exceptionsHeader = "# Слова, которые автоисправление не трогает. По строке на слово."
 let commandsHeader = "# Системные команды: считаются словами, чтобы «пкуз» превращалось в «grep»."
+
+// MARK: - Разбор сочетаний клавиш
+
+// Клавиши по именам: коды виртуальных клавиш не зависят от раскладки
+let namedKeycodes: [String: UInt32] = [
+    "0": 29, "1": 18, "2": 19, "3": 20, "4": 21, "5": 23, "6": 22, "7": 26, "8": 28, "9": 25,
+    "a": 0, "b": 11, "c": 8, "d": 2, "e": 14, "f": 3, "g": 5, "h": 4, "i": 34, "j": 38,
+    "k": 40, "l": 37, "m": 46, "n": 45, "o": 31, "p": 35, "q": 12, "r": 15, "s": 1,
+    "t": 17, "u": 32, "v": 9, "w": 13, "x": 7, "y": 16, "z": 6,
+    "-": 27, "минус": 27, "=": 24, "равно": 24, "[": 33, "]": 30, ";": 41, "'": 39,
+    ",": 43, ".": 47, "/": 44, "`": 50,
+    "space": 49, "пробел": 49, "return": 36, "ввод": 36, "tab": 48, "escape": 53, "esc": 53,
+    "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96, "f6": 97, "f7": 98, "f8": 100,
+    "f9": 101, "f10": 109, "f11": 103, "f12": 111,
+]
+
+struct Hotkey: Equatable {
+    let keycode: UInt32
+    let modifiers: UInt32
+}
+
+// «cmd+opt+-» -> код клавиши и модификаторы Carbon
+func parseHotkey(_ text: String) -> Hotkey? {
+    let parts = text.lowercased().split(separator: "+").map { $0.trimmingCharacters(in: .whitespaces) }
+    guard let keyName = parts.last, !keyName.isEmpty else { return nil }
+    var modifiers: UInt32 = 0
+    for part in parts.dropLast() {
+        switch part {
+        case "cmd", "command", "команда": modifiers |= UInt32(cmdKey)
+        case "opt", "option", "alt", "альт": modifiers |= UInt32(optionKey)
+        case "ctrl", "control", "контрол": modifiers |= UInt32(controlKey)
+        case "shift", "шифт": modifiers |= UInt32(shiftKey)
+        default: return nil
+        }
+    }
+    guard modifiers != 0, let keycode = namedKeycodes[keyName] else { return nil }
+    return Hotkey(keycode: keycode, modifiers: modifiers)
+}
+
+// MARK: - Списки по умолчанию для правил и сочетаний
+
+let defaultHotkeys = [
+    "# Сочетания: «действие = клавиши». Модификаторы: cmd, opt, ctrl, shift.",
+    "# Действия: строка, абзац, ключ, слот-1 ... слот-9.",
+    "строка = cmd+opt+-",
+    "абзац = cmd+opt+=",
+    "ключ = cmd+opt+0",
+    "слот-1 = cmd+opt+1",
+    "слот-2 = cmd+opt+2",
+    "слот-3 = cmd+opt+3",
+    "слот-4 = cmd+opt+4",
+    "слот-5 = cmd+opt+5",
+    "слот-6 = cmd+opt+6",
+    "слот-7 = cmd+opt+7",
+    "слот-8 = cmd+opt+8",
+    "слот-9 = cmd+opt+9",
+]
+
+let defaultLayoutRules = [
+    "# Правила раскладки: «идентификатор приложения = язык» (ru, en).",
+    "# Правило сильнее запоминания: приложение всегда получит указанный язык.",
+    "com.apple.Terminal = en",
+    "com.googlecode.iterm2 = en",
+    "com.termius.mac = en",
+    "com.apple.dt.Xcode = en",
+    "com.microsoft.VSCode = en",
+]
