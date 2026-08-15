@@ -29,7 +29,8 @@ let caretDotLifetime = 1.6
 let maxFnTap = 0.6               // дольше держал Fn — не тап
 let doubleShiftWindow = 0.5      // окно двойного тапа Shift
 let expandKeycode: UInt32 = 29   // Cmd+Option+0 — развернуть ключ вставки
-let slotKeycodes: Set<Int64> = [29, 18, 19, 20, 21, 23, 22, 26, 28, 25]  // цифры 0...9
+let lineKeycode: UInt32 = 27     // Cmd+Option+минус — конвертировать строку
+let slotKeycodes: Set<Int64> = [29, 18, 19, 20, 21, 23, 22, 26, 28, 25, 27]  // цифры и минус
 let maxWordLen = 32
 let syntheticMagic: Int64 = 0x4C474C4F  // метка наших синтетических событий
 let releasesAPI = "https://api.github.com/repos/kzhebenev/layout-glow/releases/latest"
@@ -57,6 +58,8 @@ final class Settings {
             "caretDot": true,
             "excludedApps": defaultExcludedApps,
             "appLayouts": [String: String](),
+            "iCloudSync": false,
+            "onboarded": false,
         ])
     }
 
@@ -91,6 +94,14 @@ final class Settings {
     var appLayouts: [String: String] {
         get { d.dictionary(forKey: "appLayouts") as? [String: String] ?? [:] }
         set { d.set(newValue, forKey: "appLayouts") }
+    }
+    var iCloudSync: Bool {
+        get { d.bool(forKey: "iCloudSync") }
+        set { d.set(newValue, forKey: "iCloudSync") }
+    }
+    var onboarded: Bool {
+        get { d.bool(forKey: "onboarded") }
+        set { d.set(newValue, forKey: "onboarded") }
     }
 
     func isExcluded(_ bundleID: String?) -> Bool {
@@ -146,9 +157,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var hotKeyRefs: [EventHotKeyRef?] = []
     var manualAXEnabled = Set<pid_t>()
 
-    let exceptionsFile = WordFile(name: "exceptions.txt", header: exceptionsHeader)
-    let commandsFile = WordFile(name: "commands.txt", header: commandsHeader, defaults: defaultCommands)
-    let snippetsFile = SnippetFile(name: "snippets.txt", header: "", defaults: defaultSnippets)
+    var exceptionsFile = WordFile(name: "exceptions.txt", header: exceptionsHeader,
+                                  directory: dictionaryDirectory(iCloud: Settings.shared.iCloudSync))
+    var commandsFile = WordFile(name: "commands.txt", header: commandsHeader, defaults: defaultCommands,
+                                directory: dictionaryDirectory(iCloud: Settings.shared.iCloudSync))
+    var snippetsFile = SnippetFile(name: "snippets.txt", header: "", defaults: defaultSnippets,
+                                   directory: dictionaryDirectory(iCloud: Settings.shared.iCloudSync))
+    var onboardingWindow: NSWindow?
 
     // Диагностика
     var keysSeen = 0
@@ -215,6 +230,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             AXIsProcessTrustedWithOptions(opts)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self.checkForUpdates(manual: false) }
+        if !Settings.shared.onboarded {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.showOnboarding(activate: false) }
+        }
     }
 
     // MARK: Окна свечения
@@ -564,7 +582,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         toggle("Конвертация по двойному Shift", s.manualConvert, #selector(toggleManual))
         toggle("Своя раскладка для каждого приложения", s.perAppLayout, #selector(togglePerApp))
         toggle("Подсветка Caps Lock", s.capsGlow, #selector(toggleCaps))
-        toggle("Точка у курсора", s.caretDot, #selector(toggleCaret))
+        toggle("Ярлык раскладки у курсора", s.caretDot, #selector(toggleCaret))
+        toggle("Словари в iCloud (общие для всех маков)", s.iCloudSync, #selector(toggleICloud))
 
         menu.addItem(.separator())
         if let app = frontApp, let bid = app.bundleIdentifier {
@@ -643,6 +662,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                              action: #selector(checkUpdatesManually), keyEquivalent: "")
         upd.target = self
         menu.addItem(upd)
+        let help = NSMenuItem(title: "Окно настройки…", action: #selector(showOnboardingFromMenu), keyEquivalent: "")
+        help.target = self
+        menu.addItem(help)
         menu.addItem(NSMenuItem(title: "Выйти", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     }
 
@@ -840,35 +862,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         default:
             let stroke = Stroke(keycode: CGKeyCode(keycode), shift: flags.contains(.maskShift),
                                 caps: flags.contains(.maskAlphaShift))
-            if let cur = currentSource(), !translate([stroke], via: cur).isEmpty {
-                keysSeen += 1
-                wordBuffer.append(stroke)
-                if wordBuffer.count > maxWordLen { wordBuffer.removeAll(); lastWord = nil }
+            guard let cur = currentSource() else { return }
+            let produced = translate([stroke], via: cur)
+            guard let char = produced.first, produced.count == 1 else { return }
+            keysSeen += 1
+
+            // Знаки вроде запятой заканчивают слово так же, как пробел
+            if boundaryChars.contains(char) {
+                let word = wordBuffer
+                wordBuffer.removeAll()
+                if !word.isEmpty {
+                    lastWord = word
+                    lastWordTrailing = 1
+                    if Settings.shared.autoCorrect {
+                        DispatchQueue.main.async { self.autoCorrect(word, boundary: stroke) }
+                    }
+                }
+                return
             }
+
+            wordBuffer.append(stroke)
+            if wordBuffer.count > maxWordLen { wordBuffer.removeAll(); lastWord = nil }
         }
     }
 
-    func autoCorrect(_ word: [Stroke]) {
+    func autoCorrect(_ word: [Stroke], boundary: Stroke? = nil) {
         guard !word.isEmpty, let cur = currentSource(), let other = otherLayout() else { return }
         if Settings.shared.isExcluded(frontApp?.bundleIdentifier) { return }
 
-        let typed = translate(word, via: cur)
-        let converted = translate(word, via: other)
+        let full = translate(word, via: cur)
+        // Хвост из знаков препинания переносим как есть: «привет.» -> «привет» + «.»
+        let (typedWord, tail) = trailingPunctuation(full)
+        guard isPureWord(typedWord) else {
+            log("пропуск «\(full)»: не слово целиком")
+            return
+        }
+        let letters = Array(word.prefix(word.count - tail.count))
+        let converted = translate(letters, via: other)
         let decision = correctionDecision(
-            typed: typed, converted: converted,
+            typed: typedWord, converted: converted,
             srcLang: sourceLang(cur), dstLang: sourceLang(other),
             commands: commandsFile.words, exceptions: exceptionsFile.words,
             capsOn: word.contains(where: { $0.caps }))
 
         guard decision.correct else {
-            log("пропуск «\(typed)»: \(decision.reason)")
+            log("пропуск «\(typedWord)»: \(decision.reason)")
             return
         }
-        log("исправлено «\(typed)» -> «\(converted)»")
-        lastAutoTyped = typed
-        performReplace(strokes: word, trailingSpaces: 1, to: other)
+        log("исправлено «\(typedWord)» -> «\(converted)»\(tail.isEmpty ? "" : " (хвост «\(tail)»)")")
+        lastAutoTyped = typedWord
+
+        // После смены раскладки те же клавиши дадут другие символы,
+        // поэтому хвост и знак-границу набираем клавишами целевой раскладки
+        var trailing: [Stroke] = []
+        for ch in tail { if let s = stroke(for: ch, in: other) { trailing.append(s) } }
+        if let boundary, let ch = translate([boundary], via: cur).first,
+           let s = stroke(for: ch, in: other) {
+            trailing.append(s)
+        } else if boundary == nil {
+            trailing.append(Stroke(keycode: 49, shift: false, caps: false))  // пробел
+        }
+
+        performReplace(strokes: letters, trailing: trailing, to: other)
         lastWord = word
-        lastWordTrailing = 1
+        lastWordTrailing = trailing.count
     }
 
     // MARK: Ручная конвертация и вставки
@@ -897,7 +954,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         log("двойной Shift: «\(currentSource().map { translate(strokes, via: $0) } ?? "")» -> «\(translate(strokes, via: other))»")
-        performReplace(strokes: strokes, trailingSpaces: trailing, to: other)
+        let trailingStrokes = Array(repeating: Stroke(keycode: 49, shift: false, caps: false), count: trailing)
+        performReplace(strokes: strokes, trailing: trailingStrokes, to: other)
         wordBuffer.removeAll()
         lastWord = strokes
         lastWordTrailing = trailing
@@ -990,6 +1048,161 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return (String(text.map { map[$0] ?? $0 }), target)
     }
 
+    // MARK: Конвертация текущей строки (Cmd+Option+минус)
+
+    func convertLine() {
+        if convertLineViaAccessibility() { return }
+        // Запасной путь: выделяем строку клавишами и конвертируем как выделение
+        guard ensureAccessibility() else { return }
+        DispatchQueue.global(qos: .userInteractive).async {
+            self.postKey(123, flags: [.maskShift, .maskCommand])  // Shift+Cmd+Влево
+            usleep(120000)
+            DispatchQueue.main.async {
+                if self.convertSelection() {
+                    self.log("строка: конвертирована через выделение")
+                } else {
+                    self.postKey(124, flags: [])  // снимаем выделение
+                    self.log("строка: «\(self.frontApp?.localizedName ?? "?")» не отдаёт текст")
+                }
+            }
+        }
+    }
+
+    func convertLineViaAccessibility() -> Bool {
+        guard let element = focusedElement() else { return false }
+        var valueRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &valueRef) == .success,
+              let text = valueRef as? String, !text.isEmpty else { return false }
+        var rangeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success,
+              let rv = rangeRef, CFGetTypeID(rv) == AXValueGetTypeID() else { return false }
+        var caretRange = CFRange()
+        AXValueGetValue(rv as! AXValue, .cfRange, &caretRange)
+
+        let ns = text as NSString
+        let caret = min(max(0, caretRange.location), ns.length)
+        guard caret > 0 else { return false }
+        let before = ns.range(of: "\n", options: .backwards, range: NSRange(location: 0, length: caret))
+        let lineStart = before.location == NSNotFound ? 0 : before.location + 1
+        guard caret > lineStart else { return false }
+
+        let lineRange = NSRange(location: lineStart, length: caret - lineStart)
+        let line = ns.substring(with: lineRange)
+        guard let (converted, target) = convertText(line), converted != line else { return false }
+
+        var selection = CFRange(location: lineStart, length: caret - lineStart)
+        guard let selValue = AXValueCreate(.cfRange, &selection),
+              AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, selValue) == .success,
+              AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString,
+                                           converted as CFTypeRef) == .success else { return false }
+        TISSelectInputSource(target)
+        log("строка: «\(line)» -> «\(converted)»")
+        return true
+    }
+
+    // MARK: Словари в iCloud
+
+    @objc func toggleICloud() {
+        let wanted = !Settings.shared.iCloudSync
+        if wanted && iCloudDirectory() == nil {
+            alert("iCloud Drive недоступен", "Включите iCloud Drive в системных настройках и попробуйте снова.")
+            return
+        }
+        let from = dictionaryDirectory(iCloud: Settings.shared.iCloudSync)
+        let to = dictionaryDirectory(iCloud: wanted)
+        for name in ["exceptions.txt", "commands.txt", "snippets.txt"] {
+            let src = from.appendingPathComponent(name)
+            let dst = to.appendingPathComponent(name)
+            guard FileManager.default.fileExists(atPath: src.path) else { continue }
+            if FileManager.default.fileExists(atPath: dst.path) {
+                // На другом маке словарь уже есть: он и остаётся главным
+                try? FileManager.default.removeItem(at: src)
+            } else {
+                try? FileManager.default.moveItem(at: src, to: dst)
+            }
+        }
+        Settings.shared.iCloudSync = wanted
+        exceptionsFile = WordFile(name: "exceptions.txt", header: exceptionsHeader, directory: to)
+        commandsFile = WordFile(name: "commands.txt", header: commandsHeader,
+                                defaults: defaultCommands, directory: to)
+        snippetsFile = SnippetFile(name: "snippets.txt", header: "", defaults: defaultSnippets, directory: to)
+        log("словари: \(wanted ? "в iCloud" : "локально") (\(to.path))")
+        showPill(text: wanted ? "iCloud" : "локально", color: .systemGray)
+    }
+
+    // MARK: Окно первого запуска
+
+    @objc func showOnboardingFromMenu() { showOnboarding(activate: true) }
+
+    // При первом запуске окно не отбирает фокус: приложение стартует само,
+    // и перехватывать клавиатуру у того, кто уже печатает, нельзя
+    func showOnboarding(activate: Bool) {
+        if let w = onboardingWindow {
+            if activate {
+                w.makeKeyAndOrderFront(nil)
+                NSApp.activate(ignoringOtherApps: true)
+            } else {
+                w.orderFrontRegardless()
+            }
+            return
+        }
+        let size = NSSize(width: 460, height: 330)
+        let w = NSWindow(contentRect: NSRect(origin: .zero, size: size),
+                         styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        w.title = "Настройка LayoutGlow"
+        w.center()
+        w.isReleasedWhenClosed = false
+
+        let content = NSView(frame: NSRect(origin: .zero, size: size))
+        func label(_ text: String, y: CGFloat, size fontSize: CGFloat, bold: Bool = false) {
+            let l = NSTextField(wrappingLabelWithString: text)
+            l.frame = NSRect(x: 24, y: y, width: size.width - 48, height: fontSize * 2.6)
+            l.font = bold ? .systemFont(ofSize: fontSize, weight: .semibold) : .systemFont(ofSize: fontSize)
+            l.isEditable = false
+            l.drawsBackground = false
+            content.addSubview(l)
+        }
+        func button(_ title: String, y: CGFloat, action: Selector) {
+            let b = NSButton(title: title, target: self, action: action)
+            b.frame = NSRect(x: 24, y: y, width: size.width - 48, height: 28)
+            b.bezelStyle = .rounded
+            content.addSubview(b)
+        }
+
+        label("Три шага, чтобы всё заработало", y: size.height - 56, size: 15, bold: true)
+        label("1. Мониторинг ввода — чтобы ловить нажатия и тап Fn", y: size.height - 96, size: 12)
+        button("Открыть Мониторинг ввода", y: size.height - 128, action: #selector(openInputMonitoring))
+        label("2. Универсальный доступ — чтобы исправлять текст и вставлять", y: size.height - 168, size: 12)
+        button("Открыть Универсальный доступ", y: size.height - 200, action: #selector(openAccessibility))
+        label("3. Клавиатура: «Press Globe key to» поставить в «Do Nothing», иначе тап Fn останется медленным",
+              y: size.height - 250, size: 12)
+        button("Открыть настройки клавиатуры", y: size.height - 282, action: #selector(openKeyboardSettings))
+
+        let done = NSButton(title: "Готово", target: self, action: #selector(finishOnboarding))
+        done.frame = NSRect(x: size.width - 110, y: 16, width: 86, height: 28)
+        done.bezelStyle = .rounded
+        content.addSubview(done)
+
+        w.contentView = content
+        w.level = .floating
+        if activate {
+            w.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        } else {
+            w.orderFrontRegardless()
+        }
+        onboardingWindow = w
+    }
+
+    @objc func finishOnboarding() {
+        Settings.shared.onboarded = true
+        onboardingWindow?.close()
+    }
+
+    @objc func openKeyboardSettings() {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.keyboard")!)
+    }
+
     // MARK: Синтетический ввод
 
     func postKey(_ keycode: CGKeyCode, flags: CGEventFlags = []) {
@@ -1036,22 +1249,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    func performReplace(strokes: [Stroke], trailingSpaces: Int, to target: TISInputSource) {
+    func performReplace(strokes: [Stroke], trailing: [Stroke], to target: TISInputSource) {
         guard !replaceInProgress, ensureAccessibility() else { return }
         replaceInProgress = true
-        let total = strokes.count + trailingSpaces
+        let total = strokes.count + trailing.count
         DispatchQueue.global(qos: .userInteractive).async {
             for _ in 0..<total { self.postKey(51) }
             usleep(20000)
             DispatchQueue.main.sync { _ = TISSelectInputSource(target) }
             usleep(50000)  // даём раскладке примениться
-            for s in strokes {
+            for s in strokes + trailing {
                 var flags: CGEventFlags = []
                 if s.shift { flags.insert(.maskShift) }
                 if s.caps { flags.insert(.maskAlphaShift) }
                 self.postKey(s.keycode, flags: flags)
             }
-            for _ in 0..<trailingSpaces { self.postKey(49) }
             DispatchQueue.main.async { self.replaceInProgress = false }
         }
     }
@@ -1067,14 +1279,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                               nil, MemoryLayout<EventHotKeyID>.size, nil, &hkID)
             let me = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
             DispatchQueue.main.async {
-                if hkID.id == 0 { me.expandSnippet() } else { me.insertSlot(Int(hkID.id)) }
+                switch hkID.id {
+                case 0: me.expandSnippet()
+                case 10: me.convertLine()
+                default: me.insertSlot(Int(hkID.id))
+                }
             }
             return noErr
         }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), nil)
 
         // Cmd+Option+0 разворачивает набранный ключ, Cmd+Option+1...9 — слоты
         var failed: [String] = []
-        let digitKeycodes: [UInt32] = [expandKeycode, 18, 19, 20, 21, 23, 22, 26, 28, 25]  // 0...9
+        let digitKeycodes: [UInt32] = [expandKeycode, 18, 19, 20, 21, 23, 22, 26, 28, 25, lineKeycode]
         for (index, keycode) in digitKeycodes.enumerated() {
             var ref: EventHotKeyRef?
             let id = EventHotKeyID(signature: OSType(0x4C474C4F), id: UInt32(index))

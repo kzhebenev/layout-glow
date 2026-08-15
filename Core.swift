@@ -12,6 +12,13 @@ struct Stroke {
 // Дефис и апостроф внутри слова допустимы: «дабл-шифт» разбирается по частям
 let wordSeparators: Set<Character> = ["-", "'", "\u{2019}"]
 
+// Знаки, на которых слово считается законченным и проверяется
+let boundaryChars: Set<Character> = [",", ";", "!", "?", ")", "]", "}", "\u{00AB}", "\u{00BB}"]
+
+// Знаки, встречающиеся внутри путей, доменов и адресов: на них слово
+// не проверяется, чтобы не калечить «com.apple» и «kz@devkz.ru»
+let identifierChars: Set<Character> = [".", "/", ":", "@", "_", "\\", "#", "&", "=", "+", "~", "%", "$"]
+
 // Спеллчекер считает валидной любую одиночную букву,
 // поэтому однобуквенные слова разрешены только по списку
 let singleLetterWords: [String: Set<String>] = [
@@ -122,6 +129,35 @@ func isWordLike(_ s: String) -> Bool {
     return true
 }
 
+// Только буквы (плюс дефис и апостроф) — значит, это слово,
+// а не часть пути, адреса или команды с аргументами
+func isPureWord(_ s: String) -> Bool {
+    !s.isEmpty && s.allSatisfy { $0.isLetter || wordSeparators.contains($0) }
+}
+
+// Отделяет хвост из знаков препинания: «привет...» -> («привет», «...»)
+func trailingPunctuation(_ s: String) -> (word: String, tail: String) {
+    var word = s
+    var tail = ""
+    while let last = word.last, !last.isLetter, !wordSeparators.contains(last) {
+        tail.insert(last, at: tail.startIndex)
+        word.removeLast()
+    }
+    return (word, tail)
+}
+
+// Какими клавишами набрать этот символ в указанной раскладке
+func stroke(for character: Character, in source: TISInputSource) -> Stroke? {
+    let target = String(character)
+    for code in 0...50 {
+        for shift in [false, true] {
+            let s = Stroke(keycode: CGKeyCode(code), shift: shift, caps: false)
+            if translate([s], via: source) == target { return s }
+        }
+    }
+    return nil
+}
+
 func wordParts(_ s: String) -> [String] {
     s.split(whereSeparator: { wordSeparators.contains($0) }).map(String.init)
 }
@@ -179,6 +215,21 @@ func supportDirectory() -> URL {
     return dir
 }
 
+// Папка в iCloud Drive: словари, общие для всех маков
+func iCloudDirectory() -> URL? {
+    let base = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs")
+    guard FileManager.default.fileExists(atPath: base.path) else { return nil }
+    let dir = base.appendingPathComponent("LayoutGlow")
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir
+}
+
+// Куда класть словари сейчас: локально или в iCloud
+func dictionaryDirectory(iCloud: Bool) -> URL {
+    (iCloud ? iCloudDirectory() : nil) ?? supportDirectory()
+}
+
 // Список слов: по строке на слово, «#» — комментарий. Перечитывается при изменении файла.
 final class WordFile {
     let url: URL
@@ -186,8 +237,8 @@ final class WordFile {
     private var mtime: Date?
     private(set) var words: Set<String> = []
 
-    init(name: String, header: String, defaults: [String] = []) {
-        self.url = supportDirectory().appendingPathComponent(name)
+    init(name: String, header: String, defaults: [String] = [], directory: URL? = nil) {
+        self.url = (directory ?? supportDirectory()).appendingPathComponent(name)
         self.header = header
         if !FileManager.default.fileExists(atPath: url.path) {
             let body = ([header] + defaults).joined(separator: "\n") + "\n"
@@ -237,8 +288,8 @@ final class SnippetFile {
     private var mtime: Date?
     private(set) var items: [String: String] = [:]
 
-    init(name: String, header: String, defaults: [String] = []) {
-        self.url = supportDirectory().appendingPathComponent(name)
+    init(name: String, header: String, defaults: [String] = [], directory: URL? = nil) {
+        self.url = (directory ?? supportDirectory()).appendingPathComponent(name)
         if !FileManager.default.fileExists(atPath: url.path) {
             let body = ([header] + defaults).joined(separator: "\n") + "\n"
             try? body.write(to: url, atomically: true, encoding: .utf8)

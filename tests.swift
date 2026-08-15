@@ -68,6 +68,20 @@ check(!isWordLike("-привет"), "isWordLike: дефис в начале")
 check(!isWordLike("па4оль"), "isWordLike: с цифрой")
 check(wordParts("дабл-шифт") == ["дабл", "шифт"], "wordParts: разбор по дефису")
 
+// Границы слова и хвосты знаков препинания
+check(trailingPunctuation("привет").tail == "", "хвост: чистое слово")
+check(trailingPunctuation("привет.") == ("привет", "."), "хвост: точка")
+check(trailingPunctuation("привет?!") == ("привет", "?!"), "хвост: два знака")
+check(trailingPunctuation("...") == ("", "..."), "хвост: одни знаки")
+check(isPureWord("привет"), "чистое слово")
+check(isPureWord("дабл-шифт"), "чистое слово с дефисом")
+check(!isPureWord("com.apple"), "точка — не чистое слово")
+check(!isPureWord("kz@devkz"), "адрес — не чистое слово")
+check(!isPureWord("па4оль"), "цифра — не чистое слово")
+check(boundaryChars.contains(","), "запятая — граница слова")
+check(!boundaryChars.contains("."), "точка не граница: ломала бы пути и домены")
+check(identifierChars.contains("@"), "собака — часть адреса")
+
 // Словарь вставок
 let parsed = SnippetFile.parse("""
 # комментарий
