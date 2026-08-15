@@ -24,7 +24,7 @@ let pillLifetime = 1.0           // сколько секунд висит пл�
 // MARK: - Поведение
 
 let maxFnTap = 0.6               // дольше держал Fn — не тап
-let doubleShiftWindow = 0.35     // окно двойного тапа Shift
+let doubleShiftWindow = 0.5      // окно двойного тапа Shift
 let minAutoWordLen = 3           // короче — автоисправление не трогает
 let maxWordLen = 32
 let syntheticMagic: Int64 = 0x4C474C4F  // метка наших синтетических событий
@@ -223,6 +223,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var lastAutoTyped: String?          // что автоисправление заменило (для самообучения)
     var frontApp: NSRunningApplication? // последнее не наше активное приложение
 
+    // Диагностика: пишется в ~/Library/Application Support/LayoutGlow/status.log
+    var keysSeen = 0
+    var shiftTaps = 0
+    var doubleShifts = 0
+    var events: [String] = []
+
     func applicationDidFinishLaunching(_ note: Notification) {
         if Bundle.main.bundlePath.hasSuffix(".app"),
            SMAppService.mainApp.status != .enabled {
@@ -258,6 +264,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         startTap()
+        AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.4)
+        Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.writeStatus() }
+        writeStatus()
+
         if !AXIsProcessTrusted() {
             let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
             AXIsProcessTrustedWithOptions(opts)
@@ -360,7 +370,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // MARK: Диагностика
+
+    func log(_ line: String) {
+        events.append(line)
+        if events.count > 40 { events.removeFirst(events.count - 40) }
+        writeStatus()
+    }
+
+    func writeStatus() {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("LayoutGlow")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let fnUsage = CFPreferencesCopyAppValue("AppleFnUsageType" as CFString,
+                                                "com.apple.HIToolbox" as CFString) as? Int ?? -1
+        var text = """
+        перехват клавиатуры: \(eventTap != nil ? "работает" : "НЕТ (нужен Мониторинг ввода)")
+        универсальный доступ: \(AXIsProcessTrusted() ? "выдан" : "НЕ ВЫДАН")
+        нажатий получено: \(keysSeen)
+        тапов Shift: \(shiftTaps), из них двойных: \(doubleShifts)
+        в буфере слова: \(wordBuffer.count) симв.
+        AppleFnUsageType: \(fnUsage) (0 = Do Nothing, тап Fn наш)
+        раскладка: \(lastLayout)
+        активное приложение: \(frontApp?.bundleIdentifier ?? "—")
+        автоисправление: \(Settings.shared.autoCorrect), двойной Shift: \(Settings.shared.manualConvert)
+
+        события:
+        """
+        text += "\n" + events.joined(separator: "\n") + "\n"
+        try? text.write(to: dir.appendingPathComponent("status.log"), atomically: true, encoding: .utf8)
+    }
+
     // MARK: Меню-бар
+
+    func appName(for bundleID: String) -> String {
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+            let name = FileManager.default.displayName(atPath: url.path)
+            return name.hasSuffix(".app") ? String(name.dropLast(4)) : name
+        }
+        return bundleID
+    }
 
     func buildStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -392,16 +441,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
         if let app = frontApp, let bid = app.bundleIdentifier {
-            let name = app.localizedName ?? bid
+            let name = app.localizedName ?? appName(for: bid)
             toggle("Автоисправление в «\(name)»", !s.isExcluded(bid), #selector(toggleFrontApp))
         }
         let excluded = s.excludedApps.sorted()
         if !excluded.isEmpty {
             let sub = NSMenu()
             for bid in excluded {
-                let i = NSMenuItem(title: bid, action: #selector(removeExcludedApp(_:)), keyEquivalent: "")
+                let i = NSMenuItem(title: appName(for: bid), action: #selector(removeExcludedApp(_:)), keyEquivalent: "")
                 i.target = self
                 i.representedObject = bid
+                i.toolTip = "\(bid) — нажмите, чтобы включить автоисправление здесь"
                 sub.addItem(i)
             }
             let head = NSMenuItem(title: "Выключено в приложениях (\(excluded.count))", action: nil, keyEquivalent: "")
@@ -539,8 +589,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 shiftDown = false
                 let now = ProcessInfo.processInfo.systemUptime
                 if Settings.shared.manualConvert && !shiftUsedAsModifier {
+                    shiftTaps += 1
                     if now - lastShiftTapAt < doubleShiftWindow {
                         lastShiftTapAt = 0
+                        doubleShifts += 1
                         DispatchQueue.main.async { self.manualConvert() }
                     } else {
                         lastShiftTapAt = now
@@ -604,7 +656,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                 caps: flags.contains(.maskAlphaShift))
             if let cur = currentSource(), !translate([stroke], via: cur).isEmpty {
                 wordBuffer.append(stroke)
-                if wordBuffer.count > maxWordLen { wordBuffer.removeAll(); lastWord = nil }
+                keysSeen += 1
+            if wordBuffer.count > maxWordLen { wordBuffer.removeAll(); lastWord = nil }
             }
         }
     }
@@ -615,17 +668,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if Settings.shared.isExcluded(frontApp?.bundleIdentifier) { return }
 
         let typed = translate(word, via: cur)
+        defer { writeStatus() }
         let capsOn = word.contains(where: { $0.caps })
         // Аббревиатура (HD, СКЗИ): всё заглавными и Caps Lock не был включён
         if !capsOn, typed.rangeOfCharacter(from: .letters) != nil, typed == typed.uppercased() { return }
         if Settings.shared.exceptions.contains(typed.lowercased()) { return }
 
         let converted = translate(word, via: other)
-        guard converted.count >= minAutoWordLen,
-              converted.allSatisfy({ $0.isLetter }),
-              !isValidWord(typed, lang: sourceLang(cur)),
-              isValidWord(converted, lang: sourceLang(other)) else { return }
+        guard converted.count >= minAutoWordLen, converted.allSatisfy({ $0.isLetter }) else {
+            log("пропуск «\(typed)»: не слово целиком")
+            return
+        }
+        guard !isValidWord(typed, lang: sourceLang(cur)) else {
+            log("пропуск «\(typed)»: валидно в \(sourceLang(cur))")
+            return
+        }
+        guard isValidWord(converted, lang: sourceLang(other)) else {
+            log("пропуск «\(typed)»: «\(converted)» невалидно в \(sourceLang(other))")
+            return
+        }
 
+        log("исправлено «\(typed)» -> «\(converted)»")
         lastAutoTyped = typed
         performReplace(strokes: word, trailingSpaces: 1, to: other)
         lastWord = word
@@ -636,16 +699,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func manualConvert() {
         // Сначала пробуем выделенный текст — конвертируем его целиком
-        if convertSelection() { return }
+        if convertSelection() { log("двойной Shift: конвертирован выделенный текст"); return }
 
-        guard let other = otherLayout() else { return }
+        guard let other = otherLayout() else { log("двойной Shift: нет второй раскладки"); return }
         let strokes: [Stroke]
         let trailing: Int
         if !wordBuffer.isEmpty {
             strokes = wordBuffer; trailing = 0
         } else if let lw = lastWord {
             strokes = lw; trailing = lastWordTrailing
-        } else { return }
+        } else {
+            log("двойной Shift: нечего конвертировать (буфер пуст)")
+            return
+        }
+        log("двойной Shift: «\(currentSource().map { translate(strokes, via: $0) } ?? "")» -> «\(translate(strokes, via: other))»")
 
         // Откат автоисправления = слово уходит в исключения (самообучение)
         if let typed = lastAutoTyped, let cur = currentSource(),
