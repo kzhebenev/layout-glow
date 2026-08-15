@@ -21,14 +21,15 @@ let capsStyle = Style(color: NSColor(red: 0.95, green: 0.15, blue: 0.35, alpha: 
 let glowHeight: CGFloat = 48     // высота полосы свечения у нижнего края
 let flashAlpha: CGFloat = 0.95   // вспышка в момент переключения
 let pillLifetime = 1.0           // сколько секунд висит плашка
-let caretDotSize: CGFloat = 10   // точка у курсора
-let caretDotLifetime = 1.2
+let caretBadgeHeight: CGFloat = 22   // ярлык раскладки у курсора
+let caretDotLifetime = 1.6
 
 // MARK: - Поведение
 
 let maxFnTap = 0.6               // дольше держал Fn — не тап
 let doubleShiftWindow = 0.5      // окно двойного тапа Shift
 let expandKeycode: UInt32 = 29   // Cmd+Option+0 — развернуть ключ вставки
+let slotKeycodes: Set<Int64> = [29, 18, 19, 20, 21, 23, 22, 26, 28, 25]  // цифры 0...9
 let maxWordLen = 32
 let syntheticMagic: Int64 = 0x4C474C4F  // метка наших синтетических событий
 let releasesAPI = "https://api.github.com/repos/kzhebenev/layout-glow/releases/latest"
@@ -143,6 +144,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var restoringLayout = false
 
     var hotKeyRefs: [EventHotKeyRef?] = []
+    var manualAXEnabled = Set<pid_t>()
 
     let exceptionsFile = WordFile(name: "exceptions.txt", header: exceptionsHeader)
     let commandsFile = WordFile(name: "commands.txt", header: commandsHeader, defaults: defaultCommands)
@@ -169,6 +171,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             name: NSNotification.Name("AppleSelectedInputSourcesChangedNotification"),
             object: nil, suspensionBehavior: .deliverImmediately)
 
+        // Отладочный триггер: показать тестовую точку без открытия меню
+        DistributedNotificationCenter.default().addObserver(
+            self, selector: #selector(testDot),
+            name: NSNotification.Name("ru.devkz.layoutglow.testdot"),
+            object: nil, suspensionBehavior: .deliverImmediately)
+
         NotificationCenter.default.addObserver(
             self, selector: #selector(screensChanged),
             name: NSApplication.didChangeScreenParametersNotification, object: nil)
@@ -180,6 +188,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                   let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
             if app.bundleIdentifier != Bundle.main.bundleIdentifier {
                 self.frontApp = app
+                self.enableManualAccessibility(for: app)
                 self.restoreLayout(for: app)
             }
             self.wordBuffer.removeAll()
@@ -375,7 +384,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func showCaretDot(color: NSColor) {
         guard Settings.shared.caretDot, let primary = NSScreen.screens.first else { return }
         guard let element = focusedElement() else {
-            log("точка: нет фокуса ввода (\(frontApp?.localizedName ?? "?"))")
+            // Electron мог не отдать дерево — просим его включить и пробуем ещё раз
+            if let app = frontApp, !manualAXEnabled.contains(app.processIdentifier) {
+                enableManualAccessibility(for: app)
+                log("точка: включаю доступность в «\(app.localizedName ?? "?")», повтор")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { self.showCaretDot(color: color) }
+            } else {
+                log("точка: нет фокуса ввода (\(frontApp?.localizedName ?? "?"))")
+            }
             return
         }
         let exact = caretRect(element)
@@ -383,21 +399,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             log("точка: «\(frontApp?.localizedName ?? "?")» не отдаёт координаты")
             return
         }
-        if exact == nil { log("точка: по рамке поля (каретка недоступна)") }
+        // Универсальный доступ отдаёт координаты от левого верхнего угла
+        let flippedY = primary.frame.maxY - rect.maxY
+        let origin = NSPoint(x: rect.maxX + 6, y: flippedY + rect.height / 2 - caretBadgeHeight / 2)
+        log("точка: \(exact == nil ? "по рамке поля" : "у каретки") "
+            + "AX(\(Int(rect.minX)),\(Int(rect.minY)) \(Int(rect.width))x\(Int(rect.height))) "
+            + "-> экран(\(Int(origin.x)),\(Int(origin.y))), экран высотой \(Int(primary.frame.maxY))")
+        showDot(at: origin, color: color)
+    }
+
+    func showDot(at origin: NSPoint, color: NSColor) {
         caretTimer?.invalidate()
         caretWindow?.orderOut(nil)
 
-        // Универсальный доступ отдаёт координаты от левого верхнего угла
-        let flippedY = primary.frame.maxY - rect.maxY
-        let origin = NSPoint(x: rect.minX - caretDotSize - 4, y: flippedY + rect.height / 2 - caretDotSize / 2)
-        let w = borderlessWindow(rect: NSRect(origin: origin, size: NSSize(width: caretDotSize, height: caretDotSize)))
+        let text = currentStyle().label
+        let size = NSSize(width: max(34, CGFloat(text.count) * 11 + 16), height: caretBadgeHeight)
+        let w = borderlessWindow(rect: NSRect(origin: origin, size: size))
 
-        let view = NSView(frame: NSRect(x: 0, y: 0, width: caretDotSize, height: caretDotSize))
+        let view = NSView(frame: NSRect(origin: .zero, size: size))
         view.wantsLayer = true
         view.layer?.backgroundColor = color.cgColor
-        view.layer?.cornerRadius = caretDotSize / 2
+        view.layer?.cornerRadius = caretBadgeHeight / 2
+        view.layer?.borderColor = NSColor.white.withAlphaComponent(0.85).cgColor
+        view.layer?.borderWidth = 1.5
+        view.layer?.shadowColor = NSColor.black.cgColor
+        view.layer?.shadowRadius = 4
+        view.layer?.shadowOpacity = 0.35
+        view.layer?.shadowOffset = CGSize(width: 0, height: -1)
+
+        let label = NSTextField(labelWithString: text)
+        label.font = .systemFont(ofSize: 12, weight: .bold)
+        label.textColor = .white
+        label.alignment = .center
+        label.frame = NSRect(x: 0, y: (size.height - 15) / 2, width: size.width, height: 15)
+        view.addSubview(label)
+
         w.contentView = view
-        w.alphaValue = 0.95
+        w.alphaValue = 1
         w.orderFrontRegardless()
         caretWindow = w
 
@@ -410,6 +448,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if self?.caretWindow === w { self?.caretWindow = nil }
             })
         }
+    }
+
+    // Electron (Claude, Termius, VS Code) держит дерево доступности выключенным,
+    // пока его об этом не попросят
+    func enableManualAccessibility(for app: NSRunningApplication) {
+        let pid = app.processIdentifier
+        guard pid > 0, !manualAXEnabled.contains(pid) else { return }
+        manualAXEnabled.insert(pid)
+        let element = AXUIElementCreateApplication(pid)
+        AXUIElementSetAttributeValue(element, "AXManualAccessibility" as CFString, kCFBooleanTrue)
     }
 
     // MARK: Раскладка для каждого приложения
@@ -554,6 +602,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let reload = NSMenuItem(title: "Перечитать словари", action: #selector(reloadDictionaries), keyEquivalent: "")
         reload.target = self
         dicts.addItem(reload)
+        let dotTest = NSMenuItem(title: "Проверить ярлык у курсора", action: #selector(testDot), keyEquivalent: "")
+        dotTest.target = self
+        dicts.addItem(dotTest)
         menu.setSubmenu(dicts, for: dictHead)
 
         // Слоты вставок Cmd+Option+цифра
@@ -621,6 +672,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         snippetsFile.reload(force: true)
         showPill(text: "словари", color: .systemGray)
     }
+    @objc func testDot() {
+        guard let screen = NSScreen.main else { return }
+        let origin = NSPoint(x: screen.frame.midX, y: screen.frame.midY)
+        log("тест точки в центре экрана: (\(Int(origin.x)),\(Int(origin.y)))")
+        showDot(at: origin, color: currentStyle().color)
+    }
+
     @objc func insertSlotItem(_ sender: NSMenuItem) {
         guard let n = sender.representedObject as? Int else { return }
         insertSlot(n)
@@ -757,6 +815,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if IsSecureEventInputEnabled() { wordBuffer.removeAll(); lastWord = nil; return }
         let flags = event.flags
         if flags.contains(.maskCommand) || flags.contains(.maskControl) || flags.contains(.maskAlternate) {
+            // Своё сочетание Cmd+Option+цифра буфер не сбрасывает:
+            // иначе набранный ключ вставки стирается перед разворотом
+            if flags.contains(.maskCommand), flags.contains(.maskAlternate),
+               slotKeycodes.contains(keycode) { return }
             wordBuffer.removeAll(); lastWord = nil
             return
         }
@@ -844,7 +906,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Тройной Shift: набранный ключ заменяется текстом из словаря вставок
     func expandSnippet() {
         guard !wordBuffer.isEmpty, let cur = currentSource() else {
-            log("тройной Shift: ключ не набран")
+            log("Cmd+Option+0: ключ не набран")
             return
         }
         let typed = translate(wordBuffer, via: cur)
@@ -854,7 +916,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             value = snippetsFile.value(for: translate(wordBuffer, via: other))
         }
         guard let text = value else {
-            log("тройной Shift: нет вставки для «\(typed)»")
+            log("Cmd+Option+0: нет вставки для «\(typed)»")
             showPill(text: "нет «\(typed)»", color: .systemGray)
             return
         }
