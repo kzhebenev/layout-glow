@@ -25,8 +25,17 @@ let pillLifetime = 1.0           // сколько секунд висит пл�
 
 let maxFnTap = 0.6               // дольше держал Fn — не тап
 let doubleShiftWindow = 0.5      // окно двойного тапа Shift
-let minAutoWordLen = 3           // короче — автоисправление не трогает
 let maxWordLen = 32
+
+// Дефис и апостроф внутри слова допустимы: «дабл-шифт» разбирается по частям
+let wordSeparators: Set<Character> = ["-", "'", "\u{2019}"]
+
+// Спеллчекер считает валидной любую одиночную букву, поэтому
+// однобуквенные слова разрешены только по списку
+let singleLetterWords: [String: Set<String>] = [
+    "ru": ["я", "в", "и", "к", "с", "у", "а", "о"],
+    "en": ["a", "i"],
+]
 let syntheticMagic: Int64 = 0x4C474C4F  // метка наших синтетических событий
 
 // Приложения, где автоисправление выключено по умолчанию.
@@ -186,6 +195,31 @@ func isValidWord(_ word: String, lang: String) -> Bool {
     let r = NSSpellChecker.shared.checkSpelling(of: word, startingAt: 0, language: lang,
                                                 wrap: false, inSpellDocumentWithTag: 0, wordCount: nil)
     return r.location == NSNotFound
+}
+
+// Буквы, между которыми допустимы дефис и апостроф
+func isWordLike(_ s: String) -> Bool {
+    guard let first = s.first, let last = s.last, first.isLetter, last.isLetter,
+          s.allSatisfy({ $0.isLetter || wordSeparators.contains($0) }) else { return false }
+    return true
+}
+
+func wordParts(_ s: String) -> [String] {
+    s.split(whereSeparator: { wordSeparators.contains($0) }).map(String.init)
+}
+
+// Осмысленно ли это на данном языке: каждая часть — словарное слово,
+// а однобуквенные — только из списка
+func meaningful(_ s: String, lang: String) -> Bool {
+    let base = String(lang.prefix(2)).lowercased()
+    let parts = wordParts(s)
+    guard !parts.isEmpty else { return false }
+    return parts.allSatisfy { part in
+        if part.count == 1 {
+            return singleLetterWords[base]?.contains(part.lowercased()) ?? false
+        }
+        return isValidWord(part, lang: lang)
+    }
 }
 
 // MARK: - Свечение
@@ -663,7 +697,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func autoCorrect(_ word: [Stroke]) {
-        guard word.count >= minAutoWordLen,
+        guard !word.isEmpty,
               let cur = currentSource(), let other = otherLayout() else { return }
         if Settings.shared.isExcluded(frontApp?.bundleIdentifier) { return }
 
@@ -675,16 +709,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if Settings.shared.exceptions.contains(typed.lowercased()) { return }
 
         let converted = translate(word, via: other)
-        guard converted.count >= minAutoWordLen, converted.allSatisfy({ $0.isLetter }) else {
+        let srcLang = sourceLang(cur), dstLang = sourceLang(other)
+        guard isWordLike(converted) else {
             log("пропуск «\(typed)»: не слово целиком")
             return
         }
-        guard !isValidWord(typed, lang: sourceLang(cur)) else {
-            log("пропуск «\(typed)»: валидно в \(sourceLang(cur))")
+        guard !meaningful(typed, lang: srcLang) else {
+            log("пропуск «\(typed)»: валидно в \(srcLang)")
             return
         }
-        guard isValidWord(converted, lang: sourceLang(other)) else {
-            log("пропуск «\(typed)»: «\(converted)» невалидно в \(sourceLang(other))")
+        guard meaningful(converted, lang: dstLang) else {
+            log("пропуск «\(typed)»: «\(converted)» невалидно в \(dstLang)")
             return
         }
 
