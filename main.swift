@@ -956,8 +956,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let char = produced.first, produced.count == 1 else { return }
             keysSeen += 1
 
-            // Знаки вроде запятой заканчивают слово так же, как пробел
-            if boundaryChars.contains(char) {
+            // Знаки вроде запятой заканчивают слово так же, как пробел,
+            // но только если в другой раскладке это не буква
+            let otherSource = otherLayout()
+            let isBoundary = boundaryChars.contains(char)
+                && (otherSource.map { punctuationInBothLayouts(stroke, cur, $0) } ?? true)
+            if isBoundary {
                 let word = wordBuffer
                 wordBuffer.removeAll()
                 if !word.isEmpty {
@@ -979,42 +983,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard !word.isEmpty, let cur = currentSource(), let other = otherLayout() else { return }
         if Settings.shared.isExcluded(frontApp?.bundleIdentifier) { return }
 
-        let full = translate(word, via: cur)
-        // Хвост из знаков препинания переносим как есть: «привет.» -> «привет» + «.»
-        let (typedWord, tail) = trailingPunctuation(full)
-        guard isPureWord(typedWord) else {
-            log("пропуск «\(full)»: не слово целиком")
+        // Два прочтения: «всё это слово» и «в конце знаки препинания».
+        // Первое важно потому, что «;» и «,» в русской раскладке — буквы «ж» и «б»
+        var candidates: [[Stroke]] = [word]
+        var stripped = word
+        while let last = stripped.last, !(translate([last], via: cur).first?.isLetter ?? false) {
+            stripped.removeLast()
+        }
+        if !stripped.isEmpty && stripped.count != word.count { candidates.append(stripped) }
+
+        var lastReason = "не слово целиком"
+        for letters in candidates {
+            let typed = translate(letters, via: cur)
+            let converted = translate(letters, via: other)
+            let decision = correctionDecision(
+                typed: typed, converted: converted,
+                srcLang: sourceLang(cur), dstLang: sourceLang(other),
+                commands: commandsFile.words, exceptions: exceptionsFile.words,
+                capsOn: letters.contains(where: { $0.caps }))
+            guard decision.correct else {
+                lastReason = decision.reason
+                continue
+            }
+
+            let tail = Array(word.dropFirst(letters.count))
+            log("исправлено «\(typed)» -> «\(converted)»")
+            lastAutoTyped = typed
+
+            // После смены раскладки те же клавиши дадут другие символы,
+            // поэтому хвост и знак-границу набираем клавишами целевой раскладки
+            var trailing: [Stroke] = []
+            for ch in translate(tail, via: cur) {
+                if let s = stroke(for: ch, in: other) { trailing.append(s) }
+            }
+            if let boundary, let ch = translate([boundary], via: cur).first,
+               let s = stroke(for: ch, in: other) {
+                trailing.append(s)
+            } else if boundary == nil {
+                trailing.append(Stroke(keycode: 49, shift: false, caps: false))  // пробел
+            }
+
+            performReplace(strokes: letters, trailing: trailing, to: other)
+            lastWord = word
+            lastWordTrailing = trailing.count
             return
         }
-        let letters = Array(word.prefix(word.count - tail.count))
-        let converted = translate(letters, via: other)
-        let decision = correctionDecision(
-            typed: typedWord, converted: converted,
-            srcLang: sourceLang(cur), dstLang: sourceLang(other),
-            commands: commandsFile.words, exceptions: exceptionsFile.words,
-            capsOn: word.contains(where: { $0.caps }))
-
-        guard decision.correct else {
-            log("пропуск «\(typedWord)»: \(decision.reason)")
-            return
-        }
-        log("исправлено «\(typedWord)» -> «\(converted)»\(tail.isEmpty ? "" : " (хвост «\(tail)»)")")
-        lastAutoTyped = typedWord
-
-        // После смены раскладки те же клавиши дадут другие символы,
-        // поэтому хвост и знак-границу набираем клавишами целевой раскладки
-        var trailing: [Stroke] = []
-        for ch in tail { if let s = stroke(for: ch, in: other) { trailing.append(s) } }
-        if let boundary, let ch = translate([boundary], via: cur).first,
-           let s = stroke(for: ch, in: other) {
-            trailing.append(s)
-        } else if boundary == nil {
-            trailing.append(Stroke(keycode: 49, shift: false, caps: false))  // пробел
-        }
-
-        performReplace(strokes: letters, trailing: trailing, to: other)
-        lastWord = word
-        lastWordTrailing = trailing.count
+        log("пропуск «\(translate(word, via: cur))»: \(lastReason)")
     }
 
     // MARK: Ручная конвертация и вставки

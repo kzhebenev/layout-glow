@@ -112,6 +112,12 @@ check(parsed["1"] == "kz@devkz.ru", "вставки: числовой слот")
 check(parsed["пустое"] == nil, "вставки: пустое значение игнорируется")
 check(parsed.count == 2, "вставки: только валидные строки")
 
+// Клавиши, которые в одной раскладке знак, а в другой буква
+expect(typed: "ghjljk;fq", converted: "продолжай", src: "en", dst: "ru", correct: true)
+expect(typed: "ke;f", converted: "лужа", src: "en", dst: "ru", correct: true)
+expect(typed: "ht,znf", converted: "ребята", src: "en", dst: "ru", correct: true)
+expect(typed: "'nj", converted: "это", src: "en", dst: "ru", correct: true)
+
 // Раскладки: карта символов, если включены обе
 let layouts = enabledLayouts()
 if let ru = layouts.first(where: { sourceLang($0).hasPrefix("ru") }),
@@ -121,6 +127,15 @@ if let ru = layouts.first(where: { sourceLang($0).hasPrefix("ru") }),
     check(map["q"] == "й", "карта: q -> й")
     let back = charMap(from: ru, to: en)
     check(back["я"] == "z", "карта: я -> z")
+
+    // «;» и «,» — буквы в русской раскладке, значит не могут быть концом слова
+    let semicolon = Stroke(keycode: 41, shift: false, caps: false)
+    let comma = Stroke(keycode: 43, shift: false, caps: false)
+    let exclamation = Stroke(keycode: 18, shift: true, caps: false)
+    check(translate([semicolon], via: ru) == "ж", "клавиша «;» в русской даёт «ж»")
+    check(!punctuationInBothLayouts(semicolon, en, ru), "«;» не конец слова: в русской это буква")
+    check(!punctuationInBothLayouts(comma, en, ru), "«,» не конец слова: в русской это буква")
+    check(punctuationInBothLayouts(exclamation, en, ru), "«!» конец слова в обеих раскладках")
 } else {
     print("пропуск тестов карты: нужны русская и английская раскладки")
 }

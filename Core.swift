@@ -12,7 +12,10 @@ struct Stroke {
 // Дефис и апостроф внутри слова допустимы: «дабл-шифт» разбирается по частям
 let wordSeparators: Set<Character> = ["-", "'", "\u{2019}"]
 
-// Знаки, на которых слово считается законченным и проверяется
+// Знаки, на которых слово считается законченным и проверяется.
+// Годятся только те, что остаются знаками в обеих раскладках: клавиши
+// «;» и «,» в русской дают «ж» и «б», поэтому проверка идёт через
+// punctuationInBothLayouts, иначе слово рвётся посреди буквы.
 let boundaryChars: Set<Character> = [",", ";", "!", "?", ")", "]", "}", "\u{00AB}", "\u{00BB}"]
 
 // Знаки, встречающиеся внутри путей, доменов и адресов: на них слово
@@ -144,6 +147,14 @@ func trailingPunctuation(_ s: String) -> (word: String, tail: String) {
         word.removeLast()
     }
     return (word, tail)
+}
+
+// Знак ли это в обеих раскладках: «;» в английской — знак, а в русской «ж»,
+// и такую клавишу нельзя считать концом слова
+func punctuationInBothLayouts(_ stroke: Stroke, _ a: TISInputSource, _ b: TISInputSource) -> Bool {
+    let first = translate([stroke], via: a).first
+    let second = translate([stroke], via: b).first
+    return !(first?.isLetter ?? false) && !(second?.isLetter ?? false)
 }
 
 // Какими клавишами набрать этот символ в указанной раскладке
