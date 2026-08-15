@@ -324,15 +324,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Точка у курсора
 
-    // Положение каретки через Универсальный доступ; работает не во всех приложениях
-    func caretRect() -> CGRect? {
+    func focusedElement() -> AXUIElement? {
         guard AXIsProcessTrusted() else { return nil }
         let system = AXUIElementCreateSystemWide()
         var focusedRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
               let f = focusedRef, CFGetTypeID(f) == AXUIElementGetTypeID() else { return nil }
-        let element = f as! AXUIElement
+        return (f as! AXUIElement)
+    }
 
+    // Точные координаты каретки; отдают в основном нативные приложения
+    func caretRect(_ element: AXUIElement) -> CGRect? {
         var rangeRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success,
               let rv = rangeRef, CFGetTypeID(rv) == AXValueGetTypeID() else { return nil }
@@ -352,9 +354,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return rect
     }
 
+    // Запасной путь: рамка самого поля ввода. Каретку не даёт, но точка
+    // окажется у поля, а не в никуда — этого хватает, чтобы заметить цвет
+    func fieldRect(_ element: AXUIElement) -> CGRect? {
+        var posRef: CFTypeRef?
+        var sizeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &posRef) == .success,
+              AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeRef) == .success,
+              let pv = posRef, let sv = sizeRef,
+              CFGetTypeID(pv) == AXValueGetTypeID(), CFGetTypeID(sv) == AXValueGetTypeID() else { return nil }
+        var origin = CGPoint.zero
+        var size = CGSize.zero
+        AXValueGetValue(pv as! AXValue, .cgPoint, &origin)
+        AXValueGetValue(sv as! AXValue, .cgSize, &size)
+        guard size.width > 0, size.height > 0 else { return nil }
+        // Ставим точку у левого края поля, по центру первой строки
+        return CGRect(x: origin.x, y: origin.y, width: 1, height: min(size.height, 22))
+    }
+
     func showCaretDot(color: NSColor) {
-        guard Settings.shared.caretDot, let rect = caretRect(),
-              let primary = NSScreen.screens.first else { return }
+        guard Settings.shared.caretDot, let primary = NSScreen.screens.first else { return }
+        guard let element = focusedElement() else {
+            log("точка: нет фокуса ввода (\(frontApp?.localizedName ?? "?"))")
+            return
+        }
+        let exact = caretRect(element)
+        guard let rect = exact ?? fieldRect(element) else {
+            log("точка: «\(frontApp?.localizedName ?? "?")» не отдаёт координаты")
+            return
+        }
+        if exact == nil { log("точка: по рамке поля (каретка недоступна)") }
         caretTimer?.invalidate()
         caretWindow?.orderOut(nil)
 
