@@ -37,9 +37,10 @@ expect(typed: "a", converted: "ф", src: "en", dst: "ru", correct: false)
 expect(typed: "x", converted: "ч", src: "en", dst: "ru", correct: false)
 expect(typed: "on", converted: "щт", src: "en", dst: "ru", correct: false)
 
-// Дефис и апостроф
-expect(typed: "lf,k-iban", converted: "дабл-шифт", src: "en", dst: "ru", correct: true)
+// Дефис и апостроф (слова берём словарные: «дабл» и подобные системный
+// спеллчекер признаёт не всегда, и тест начинает мигать)
 expect(typed: "ghbdtn-rfr", converted: "привет-как", src: "en", dst: "ru", correct: true)
+expect(typed: "ytn-ytn", converted: "нет-нет", src: "en", dst: "ru", correct: true)
 expect(typed: "ghbdtn.rfr", converted: "привет.как", src: "en", dst: "ru", correct: false)
 
 // Аббревиатуры и исключения
