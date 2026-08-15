@@ -181,6 +181,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var lastFieldKey = ""
     var onboardingWindow: NSWindow?
     var shortcutsWindow: NSWindow?
+    var onboardingTimer: Timer?
 
     // Диагностика
     var keysSeen = 0
@@ -207,6 +208,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DistributedNotificationCenter.default().addObserver(
             self, selector: #selector(testDot),
             name: NSNotification.Name("ru.devkz.layoutglow.testdot"),
+            object: nil, suspensionBehavior: .deliverImmediately)
+        DistributedNotificationCenter.default().addObserver(
+            self, selector: #selector(showOnboardingFromMenu),
+            name: NSNotification.Name("ru.devkz.layoutglow.setup"),
             object: nil, suspensionBehavior: .deliverImmediately)
         DistributedNotificationCenter.default().addObserver(
             self, selector: #selector(showShortcuts),
@@ -309,7 +314,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func refreshGlow(animated: Bool) {
         let style = currentStyle()
-        statusItem?.button?.title = style.label
+        statusItem?.button?.attributedTitle = NSAttributedString(string: style.label, attributes: [
+            .font: NSFont.systemFont(ofSize: 12, weight: .bold),
+            .foregroundColor: style.color,
+        ])
         for w in glowWindows {
             (w.contentView as? GlowView)?.color = style.color
             if animated {
@@ -640,112 +648,142 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.removeAllItems()
         let s = Settings.shared
 
-        let layoutName = currentSource().map { sourceName($0) } ?? "—"
-        menu.addItem(withTitle: "Раскладка: \(layoutName)", action: nil, keyEquivalent: "")
-        menu.addItem(.separator())
-
-        func toggle(_ title: String, _ on: Bool, _ selector: Selector, in target: NSMenu? = nil) {
+        func header(_ text: String) {
+            let i = NSMenuItem(title: text, action: nil, keyEquivalent: "")
+            i.attributedTitle = NSAttributedString(string: text.uppercased(), attributes: [
+                .font: NSFont.systemFont(ofSize: 10, weight: .semibold),
+                .foregroundColor: NSColor.tertiaryLabelColor,
+                .kern: 0.6,
+            ])
+            i.isEnabled = false
+            menu.addItem(i)
+        }
+        func symbol(_ name: String) -> NSImage? {
+            let image = NSImage(systemSymbolName: name, accessibilityDescription: nil)
+            image?.isTemplate = true
+            return image
+        }
+        func toggle(_ title: String, _ on: Bool, _ selector: Selector, icon: String) {
             let i = NSMenuItem(title: title, action: selector, keyEquivalent: "")
             i.state = on ? .on : .off
             i.target = self
-            (target ?? menu).addItem(i)
+            i.image = symbol(icon)
+            menu.addItem(i)
         }
-        toggle("Быстрое переключение по Fn", s.fnSwitch, #selector(toggleFn))
-        toggle("Автоисправление раскладки", s.autoCorrect, #selector(toggleAuto))
-        toggle("Конвертация по двойному Shift", s.manualConvert, #selector(toggleManual))
-        toggle("Своя раскладка для каждого приложения", s.perAppLayout, #selector(togglePerApp))
-        toggle("Подсветка Caps Lock", s.capsGlow, #selector(toggleCaps))
-        toggle("Ярлык раскладки у курсора", s.caretDot, #selector(toggleCaret))
-        toggle("Раскладка по типу поля (адресная строка, поиск)", s.perFieldLayout, #selector(togglePerField))
-        toggle("Словари в iCloud (общие для всех маков)", s.iCloudSync, #selector(toggleICloud))
+        func action(_ title: String, _ selector: Selector, icon: String? = nil,
+                    into target: NSMenu? = nil, tooltip: String? = nil) -> NSMenuItem {
+            let i = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+            i.target = self
+            i.toolTip = tooltip
+            if let icon { i.image = symbol(icon) }
+            (target ?? menu).addItem(i)
+            return i
+        }
 
+        // Текущее состояние крупно и в цвет раскладки
+        let style = currentStyle()
+        let layoutName = currentSource().map { sourceName($0) } ?? "—"
+        let state = NSMenuItem(title: layoutName, action: nil, keyEquivalent: "")
+        let line = NSMutableAttributedString(string: style.label + "  ", attributes: [
+            .font: NSFont.systemFont(ofSize: 13, weight: .bold),
+            .foregroundColor: style.color,
+        ])
+        line.append(NSAttributedString(string: layoutName, attributes: [
+            .font: NSFont.systemFont(ofSize: 13),
+            .foregroundColor: NSColor.labelColor,
+        ]))
+        state.attributedTitle = line
+        state.isEnabled = false
+        menu.addItem(state)
         menu.addItem(.separator())
+
+        header("Переключение")
+        toggle("Быстрый тап Fn", s.fnSwitch, #selector(toggleFn), icon: "bolt")
+        toggle("Своя раскладка для приложений", s.perAppLayout, #selector(togglePerApp), icon: "square.grid.2x2")
+        toggle("Раскладка по типу поля", s.perFieldLayout, #selector(togglePerField), icon: "text.cursor")
+
+        header("Исправление")
+        toggle("Автоисправление раскладки", s.autoCorrect, #selector(toggleAuto), icon: "wand.and.stars")
+        toggle("Конвертация по двойному Shift", s.manualConvert, #selector(toggleManual), icon: "arrow.2.squarepath")
         if let app = frontApp, let bid = app.bundleIdentifier {
             let name = app.localizedName ?? appName(for: bid)
-            toggle("Автоисправление в «\(name)»", !s.isExcluded(bid), #selector(toggleFrontApp))
+            toggle("Исправлять в «\(name)»", !s.isExcluded(bid), #selector(toggleFrontApp), icon: "app.badge.checkmark")
         }
         let excluded = s.excludedApps.filter { isInstalled($0) }.sorted { appName(for: $0) < appName(for: $1) }
         if !excluded.isEmpty {
-            let head = NSMenuItem(title: "Выключено в приложениях (\(excluded.count))", action: nil, keyEquivalent: "")
-            menu.addItem(head)
+            let head = action("Выключено в приложениях (\(excluded.count))", #selector(doNothing), icon: "nosign")
             let sub = NSMenu()
             for bid in excluded {
                 let i = NSMenuItem(title: appName(for: bid), action: #selector(removeExcludedApp(_:)), keyEquivalent: "")
                 i.target = self
                 i.representedObject = bid
-                i.toolTip = "\(bid) — нажмите, чтобы включить автоисправление здесь"
+                i.toolTip = "\(bid) — включить исправление здесь"
                 sub.addItem(i)
             }
             menu.setSubmenu(sub, for: head)
         }
 
-        menu.addItem(.separator())
-        let dictHead = NSMenuItem(title: "Словари", action: nil, keyEquivalent: "")
-        menu.addItem(dictHead)
+        header("Вид")
+        toggle("Ярлык раскладки у курсора", s.caretDot, #selector(toggleCaret), icon: "smallcircle.filled.circle")
+        toggle("Подсветка Caps Lock", s.capsGlow, #selector(toggleCaps), icon: "capslock")
+
+        header("Словари и сочетания")
+        let dictHead = action("Файлы словарей", #selector(doNothing), icon: "folder")
         let dicts = NSMenu()
-        func fileItem(_ title: String, _ selector: Selector) {
-            let i = NSMenuItem(title: title, action: selector, keyEquivalent: "")
-            i.target = self
-            dicts.addItem(i)
-        }
-        fileItem("Исключения (\(exceptionsFile.words.count))…", #selector(openExceptions))
-        fileItem("Системные команды (\(commandsFile.words.count))…", #selector(openCommands))
-        fileItem("Вставки (\(snippetsFile.items.count))…", #selector(openSnippets))
-        fileItem("Правила раскладок (\(rulesFile.items.count))…", #selector(openRules))
-        fileItem("Сочетания клавиш…", #selector(openHotkeys))
+        _ = action("Исключения (\(exceptionsFile.words.count))…", #selector(openExceptions), into: dicts)
+        _ = action("Системные команды (\(commandsFile.words.count))…", #selector(openCommands), into: dicts)
+        _ = action("Вставки (\(snippetsFile.items.count))…", #selector(openSnippets), into: dicts)
+        _ = action("Правила раскладок (\(rulesFile.items.count))…", #selector(openRules), into: dicts)
+        _ = action("Сочетания клавиш…", #selector(openHotkeys), into: dicts)
         dicts.addItem(.separator())
-        let reload = NSMenuItem(title: "Перечитать словари", action: #selector(reloadDictionaries), keyEquivalent: "")
-        reload.target = self
-        dicts.addItem(reload)
-        let dotTest = NSMenuItem(title: "Проверить ярлык у курсора", action: #selector(testDot), keyEquivalent: "")
-        dotTest.target = self
-        dicts.addItem(dotTest)
+        _ = action("Перечитать файлы", #selector(reloadDictionaries), into: dicts)
+        _ = action("Проверить ярлык у курсора", #selector(testDot), into: dicts)
         menu.setSubmenu(dicts, for: dictHead)
 
-        // Слоты вставок Cmd+Option+цифра
+        toggle("Хранить в iCloud", s.iCloudSync, #selector(toggleICloud), icon: "icloud")
+
         let slots = (1...9).compactMap { n -> (Int, String)? in
             guard let v = snippetsFile.value(for: String(n)) else { return nil }
             return (n, v)
         }
         if !slots.isEmpty {
-            let head = NSMenuItem(title: "Быстрые вставки (\(slots.count))", action: nil, keyEquivalent: "")
-            menu.addItem(head)
+            let head = action("Быстрые вставки (\(slots.count))", #selector(doNothing), icon: "text.badge.plus")
             let sub = NSMenu()
             for (n, value) in slots {
                 let short = value.count > 40 ? String(value.prefix(40)) + "…" : value
-                let i = NSMenuItem(title: "\(n): \(short)", action: #selector(insertSlotItem(_:)), keyEquivalent: "")
+                let i = NSMenuItem(title: "\(n) — \(short)", action: #selector(insertSlotItem(_:)), keyEquivalent: "")
                 i.target = self
                 i.representedObject = n
-                i.toolTip = "Cmd+Option+\(n)"
+                i.toolTip = hotkeysFile.value(for: "слот-\(n)") ?? "cmd+opt+\(n)"
                 sub.addItem(i)
             }
             menu.setSubmenu(sub, for: head)
         }
+        _ = action("Справка по сочетаниям…", #selector(showShortcuts), icon: "questionmark.circle")
 
         menu.addItem(.separator())
-        let i1 = NSMenuItem(title: "Мониторинг ввода: \(eventTap != nil ? "выдан" : "НЕ ВЫДАН")",
-                            action: #selector(openInputMonitoring), keyEquivalent: "")
-        i1.target = self
-        menu.addItem(i1)
-        let i2 = NSMenuItem(title: "Универсальный доступ: \(AXIsProcessTrusted() ? "выдан" : "НЕ ВЫДАН")",
-                            action: #selector(openAccessibility), keyEquivalent: "")
-        i2.target = self
-        menu.addItem(i2)
+        let inputOK = eventTap != nil
+        let axOK = AXIsProcessTrusted()
+        if !inputOK || !axOK {
+            let warn = action("Нужны разрешения — открыть настройку",
+                              #selector(showOnboardingFromMenu), icon: "exclamationmark.triangle")
+            warn.attributedTitle = NSAttributedString(
+                string: "Нужны разрешения — открыть настройку",
+                attributes: [.font: NSFont.systemFont(ofSize: 13, weight: .medium),
+                             .foregroundColor: NSColor.systemOrange])
+        } else {
+            _ = action("Разрешения выданы", #selector(showOnboardingFromMenu), icon: "checkmark.seal",
+                       tooltip: "Открыть окно настройки")
+        }
 
-        menu.addItem(.separator())
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
-        let upd = NSMenuItem(title: "LayoutGlow \(version) — проверить обновления",
-                             action: #selector(checkUpdatesManually), keyEquivalent: "")
-        upd.target = self
-        menu.addItem(upd)
-        let shortcuts = NSMenuItem(title: "Справка по сочетаниям…", action: #selector(showShortcuts), keyEquivalent: "")
-        shortcuts.target = self
-        menu.addItem(shortcuts)
-        let help = NSMenuItem(title: "Окно настройки…", action: #selector(showOnboardingFromMenu), keyEquivalent: "")
-        help.target = self
-        menu.addItem(help)
-        menu.addItem(NSMenuItem(title: "Выйти", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        _ = action("Версия \(version) — проверить обновления", #selector(checkUpdatesManually), icon: "arrow.down.circle")
+        let quit = NSMenuItem(title: "Выйти", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        quit.image = symbol("power")
+        menu.addItem(quit)
     }
+
+    @objc func doNothing() {}
 
     @objc func toggleFn() { Settings.shared.fnSwitch.toggle() }
     @objc func toggleAuto() { Settings.shared.autoCorrect.toggle() }
@@ -1394,50 +1432,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             return
         }
-        let size = NSSize(width: 460, height: 330)
-        let w = NSWindow(contentRect: NSRect(origin: .zero, size: size),
-                         styleMask: [.titled, .closable], backing: .buffered, defer: false)
-        w.title = "Настройка LayoutGlow"
-        w.center()
-        w.isReleasedWhenClosed = false
 
-        let content = NSView(frame: NSRect(origin: .zero, size: size))
-        func label(_ text: String, y: CGFloat, size fontSize: CGFloat, bold: Bool = false) {
-            let l = NSTextField(wrappingLabelWithString: text)
-            l.frame = NSRect(x: 24, y: y, width: size.width - 48, height: fontSize * 2.6)
-            l.font = bold ? .systemFont(ofSize: fontSize, weight: .semibold) : .systemFont(ofSize: fontSize)
-            l.isEditable = false
-            l.drawsBackground = false
-            content.addSubview(l)
-        }
-        func button(_ title: String, y: CGFloat, action: Selector) {
-            let b = NSButton(title: title, target: self, action: action)
-            b.frame = NSRect(x: 24, y: y, width: size.width - 48, height: 28)
-            b.bezelStyle = .rounded
-            content.addSubview(b)
-        }
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
+        let title = NSTextField(labelWithString: "LayoutGlow \(version)")
+        title.font = .systemFont(ofSize: 20, weight: .semibold)
+        let subtitle = NSTextField(labelWithString: "Три шага, и всё заработает")
+        subtitle.font = .systemFont(ofSize: 13)
+        subtitle.textColor = .secondaryLabelColor
 
-        label("Три шага, чтобы всё заработало", y: size.height - 56, size: 15, bold: true)
-        label("1. Мониторинг ввода — чтобы ловить нажатия и тап Fn", y: size.height - 96, size: 12)
-        button("Открыть Мониторинг ввода", y: size.height - 128, action: #selector(openInputMonitoring))
-        label("2. Универсальный доступ — чтобы исправлять текст и вставлять", y: size.height - 168, size: 12)
-        button("Открыть Универсальный доступ", y: size.height - 200, action: #selector(openAccessibility))
-        label("3. Клавиатура: «Press Globe key to» поставить в «Do Nothing», иначе тап Fn останется медленным",
-              y: size.height - 250, size: 12)
-        button("Открыть настройки клавиатуры", y: size.height - 282, action: #selector(openKeyboardSettings))
+        let steps = NSStackView(views: [
+            stepCard(number: 1, title: "Мониторинг ввода",
+                     detail: "Чтобы ловить нажатия клавиш и тап Fn", button: "Открыть настройки",
+                     action: #selector(openInputMonitoring), tag: 1),
+            stepCard(number: 2, title: "Универсальный доступ",
+                     detail: "Чтобы исправлять текст и находить курсор", button: "Открыть настройки",
+                     action: #selector(openAccessibility), tag: 2),
+            stepCard(number: 3, title: "Клавиша Globe",
+                     detail: "«Press Globe key to» поставить в «Do Nothing», иначе тап Fn останется медленным",
+                     button: "Открыть клавиатуру", action: #selector(openKeyboardSettings), tag: 3),
+        ])
+        steps.orientation = .vertical
+        steps.spacing = 12
+        steps.alignment = .leading
+        steps.distribution = .fill
 
         let shortcutsButton = NSButton(title: "Справка по сочетаниям", target: self, action: #selector(showShortcuts))
-        shortcutsButton.frame = NSRect(x: 24, y: 16, width: 190, height: 28)
         shortcutsButton.bezelStyle = .rounded
-        content.addSubview(shortcutsButton)
-
+        shortcutsButton.controlSize = .large
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let done = NSButton(title: "Готово", target: self, action: #selector(finishOnboarding))
-        done.frame = NSRect(x: size.width - 110, y: 16, width: 86, height: 28)
         done.bezelStyle = .rounded
-        content.addSubview(done)
+        done.controlSize = .large
+        done.bezelColor = .controlAccentColor
 
-        w.contentView = content
+        let buttons = NSStackView(views: [shortcutsButton, spacer, done])
+        buttons.orientation = .horizontal
+        buttons.spacing = 10
+
+        let root = NSStackView(views: [title, subtitle, steps, buttons])
+        root.orientation = .vertical
+        root.alignment = .leading
+        root.spacing = 14
+        root.edgeInsets = NSEdgeInsets(top: 24, left: 24, bottom: 20, right: 24)
+        root.translatesAutoresizingMaskIntoConstraints = false
+
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 470),
+                         styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        w.title = "Настройка LayoutGlow"
+        w.isReleasedWhenClosed = false
         w.level = .floating
+        let container = NSView()
+        w.contentView = container
+        container.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            root.topAnchor.constraint(equalTo: container.topAnchor),
+            root.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            steps.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -48),
+            buttons.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -48),
+        ])
+        w.center()
+
         if activate {
             w.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
@@ -1445,11 +1502,91 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             w.orderFrontRegardless()
         }
         onboardingWindow = w
+        refreshOnboardingStatus()
+        onboardingTimer?.invalidate()
+        onboardingTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+            self?.refreshOnboardingStatus()
+        }
+    }
+
+    // Карточка шага: номер, заголовок, статус, пояснение и кнопка
+    func stepCard(number: Int, title: String, detail: String,
+                  button: String, action: Selector, tag: Int) -> NSView {
+        let card = NSView()
+        card.wantsLayer = true
+        card.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        card.layer?.cornerRadius = 10
+        card.layer?.borderWidth = 1
+        card.layer?.borderColor = NSColor.separatorColor.cgColor
+
+        let badge = NSTextField(labelWithString: "\(number)")
+        badge.font = .systemFont(ofSize: 13, weight: .bold)
+        badge.alignment = .center
+        badge.textColor = .white
+        badge.wantsLayer = true
+        badge.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
+        badge.layer?.cornerRadius = 11
+        badge.translatesAutoresizingMaskIntoConstraints = false
+        badge.widthAnchor.constraint(equalToConstant: 22).isActive = true
+        badge.heightAnchor.constraint(equalToConstant: 22).isActive = true
+
+        let name = NSTextField(labelWithString: title)
+        name.font = .systemFont(ofSize: 13, weight: .semibold)
+
+        let status = NSTextField(labelWithString: "проверяю…")
+        status.font = .systemFont(ofSize: 11, weight: .medium)
+        status.textColor = .secondaryLabelColor
+        status.tag = 100 + tag
+
+        let head = NSStackView(views: [badge, name, status])
+        head.orientation = .horizontal
+        head.spacing = 8
+        head.alignment = .centerY
+
+        let text = NSTextField(wrappingLabelWithString: detail)
+        text.font = .systemFont(ofSize: 12)
+        text.textColor = .secondaryLabelColor
+
+        let act = NSButton(title: button, target: self, action: action)
+        act.bezelStyle = .rounded
+
+        let stack = NSStackView(views: [head, text, act])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.edgeInsets = NSEdgeInsets(top: 12, left: 14, bottom: 12, right: 14)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: card.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: card.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: card.bottomAnchor),
+        ])
+        return card
+    }
+
+    func refreshOnboardingStatus() {
+        guard let root = onboardingWindow?.contentView else { return }
+        let fnUsage = CFPreferencesCopyAppValue("AppleFnUsageType" as CFString,
+                                                "com.apple.HIToolbox" as CFString) as? Int ?? -1
+        let states: [Int: Bool] = [101: eventTap != nil, 102: AXIsProcessTrusted(), 103: fnUsage == 0]
+        func walk(_ view: NSView) {
+            if let field = view as? NSTextField, let done = states[field.tag] {
+                field.stringValue = done ? "готово" : "нужно включить"
+                field.textColor = done ? .systemGreen : .systemOrange
+            }
+            view.subviews.forEach(walk)
+        }
+        walk(root)
     }
 
     @objc func finishOnboarding() {
         Settings.shared.onboarded = true
+        onboardingTimer?.invalidate()
+        onboardingTimer = nil
         onboardingWindow?.close()
+        onboardingWindow = nil
     }
 
     @objc func openKeyboardSettings() {
