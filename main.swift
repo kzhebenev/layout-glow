@@ -437,12 +437,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Меню-бар
 
+    // Имена приложений, которые могут быть не установлены на этом маке
+    static let knownAppNames: [String: String] = [
+        "com.apple.Terminal": "Terminal",
+        "com.googlecode.iterm2": "iTerm2",
+        "dev.warp.Warp-Stable": "Warp",
+        "net.kovidgoyal.kitty": "kitty",
+        "com.mitchellh.ghostty": "Ghostty",
+        "com.github.wez.wezterm": "WezTerm",
+        "com.termius.mac": "Termius",
+    ]
+
+    func isInstalled(_ bundleID: String) -> Bool {
+        NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) != nil
+    }
+
     func appName(for bundleID: String) -> String {
         if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
             let name = FileManager.default.displayName(atPath: url.path)
             return name.hasSuffix(".app") ? String(name.dropLast(4)) : name
         }
-        return bundleID
+        if let known = AppDelegate.knownAppNames[bundleID] { return known }
+        return bundleID.components(separatedBy: ".").last ?? bundleID
     }
 
     func buildStatusItem() {
@@ -478,7 +494,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let name = app.localizedName ?? appName(for: bid)
             toggle("Автоисправление в «\(name)»", !s.isExcluded(bid), #selector(toggleFrontApp))
         }
-        let excluded = s.excludedApps.sorted()
+        // Показываем только то, что реально установлено: список по умолчанию
+        // содержит терминалы, которых на этом маке может не быть
+        let excluded = s.excludedApps.filter { isInstalled($0) }.sorted { appName(for: $0) < appName(for: $1) }
         if !excluded.isEmpty {
             let sub = NSMenu()
             for bid in excluded {
