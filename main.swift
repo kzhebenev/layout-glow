@@ -27,7 +27,8 @@ let caretDotLifetime = 1.2
 // MARK: - Поведение
 
 let maxFnTap = 0.6               // дольше держал Fn — не тап
-let shiftTapWindow = 0.45        // окно между тапами Shift
+let doubleShiftWindow = 0.5      // окно двойного тапа Shift
+let expandKeycode: UInt32 = 29   // Cmd+Option+0 — развернуть ключ вставки
 let maxWordLen = 32
 let syntheticMagic: Int64 = 0x4C474C4F  // метка наших синтетических событий
 let releasesAPI = "https://api.github.com/repos/kzhebenev/layout-glow/releases/latest"
@@ -136,8 +137,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var shiftDown = false
     var shiftUsedAsModifier = false
     var lastShiftTapAt: TimeInterval = 0
-    var shiftTapCount = 0
-    var pendingConvert: DispatchWorkItem?
     var replaceInProgress = false
     var lastAutoTyped: String?
     var frontApp: NSRunningApplication?
@@ -682,8 +681,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 shiftUsedAsModifier = false
             } else if !pressed && shiftDown {
                 shiftDown = false
-                if !shiftUsedAsModifier { handleShiftTap() }
-                else { shiftTapCount = 0; pendingConvert?.cancel() }
+                if !shiftUsedAsModifier { handleShiftTap() } else { lastShiftTapAt = 0 }
             }
         case .flagsChanged:
             if fnDown { fnUsedAsModifier = true }
@@ -691,34 +689,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .keyDown:
             if fnDown { fnUsedAsModifier = true }
             if shiftDown { shiftUsedAsModifier = true }
-            shiftTapCount = 0
-            pendingConvert?.cancel()
+            lastShiftTapAt = 0
             trackKey(event: event, keycode: keycode)
         default:
             break
         }
     }
 
-    // Двойной тап — конвертация, тройной — вставка по ключу
+    // Двойной тап Shift — конвертация, сразу, без ожидания третьего тапа
     func handleShiftTap() {
         guard Settings.shared.manualConvert else { return }
         let now = ProcessInfo.processInfo.systemUptime
         shiftTaps += 1
-        shiftTapCount = (now - lastShiftTapAt < shiftTapWindow) ? shiftTapCount + 1 : 1
-        lastShiftTapAt = now
-        pendingConvert?.cancel()
-
-        if shiftTapCount == 2 {
-            // ждём, не будет ли третьего тапа
-            let work = DispatchWorkItem { [weak self] in
-                self?.shiftTapCount = 0
-                self?.manualConvert()
-            }
-            pendingConvert = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + shiftTapWindow, execute: work)
-        } else if shiftTapCount >= 3 {
-            shiftTapCount = 0
-            DispatchQueue.main.async { self.expandSnippet() }
+        if now - lastShiftTapAt < doubleShiftWindow {
+            lastShiftTapAt = 0
+            DispatchQueue.main.async { self.manualConvert() }
+        } else {
+            lastShiftTapAt = now
         }
     }
 
@@ -924,14 +911,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    func postText(_ text: String) {
-        let utf16 = Array(text.utf16)
-        for down in [true, false] {
-            guard let e = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: down) else { continue }
-            e.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: utf16)
-            e.setIntegerValueField(.eventSourceUserData, value: syntheticMagic)
-            e.post(tap: .cgSessionEventTap)
-            usleep(1500)
+    // Вставка через буфер обмена: синтетические Unicode-события игнорируются
+    // Electron-приложениями (Claude, Termius, VS Code), а Cmd+V понимают все
+    func pasteText(_ text: String) {
+        let pb = NSPasteboard.general
+        let savedString = pb.string(forType: .string)
+        pb.clearContents()
+        pb.setString(text, forType: .string)
+        postKey(9, flags: .maskCommand)  // Cmd+V
+        usleep(200000)
+        DispatchQueue.main.async {
+            guard let savedString else { return }
+            pb.clearContents()
+            pb.setString(savedString, forType: .string)
         }
     }
 
@@ -948,7 +940,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DispatchQueue.global(qos: .userInteractive).async {
             for _ in 0..<backspaces { self.postKey(51) }
             if backspaces > 0 { usleep(20000) }
-            self.postText(text)
+            self.pasteText(text)
             DispatchQueue.main.async { self.replaceInProgress = false }
         }
     }
@@ -983,17 +975,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
                               nil, MemoryLayout<EventHotKeyID>.size, nil, &hkID)
             let me = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
-            DispatchQueue.main.async { me.insertSlot(Int(hkID.id)) }
+            DispatchQueue.main.async {
+                if hkID.id == 0 { me.expandSnippet() } else { me.insertSlot(Int(hkID.id)) }
+            }
             return noErr
         }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), nil)
 
-        let digitKeycodes: [UInt32] = [18, 19, 20, 21, 23, 22, 26, 28, 25]  // 1...9
+        // Cmd+Option+0 разворачивает набранный ключ, Cmd+Option+1...9 — слоты
+        var failed: [String] = []
+        let digitKeycodes: [UInt32] = [expandKeycode, 18, 19, 20, 21, 23, 22, 26, 28, 25]  // 0...9
         for (index, keycode) in digitKeycodes.enumerated() {
             var ref: EventHotKeyRef?
-            let id = EventHotKeyID(signature: OSType(0x4C474C4F), id: UInt32(index + 1))
-            RegisterEventHotKey(keycode, UInt32(cmdKey | optionKey), id, GetApplicationEventTarget(), 0, &ref)
+            let id = EventHotKeyID(signature: OSType(0x4C474C4F), id: UInt32(index))
+            let status = RegisterEventHotKey(keycode, UInt32(cmdKey | optionKey), id,
+                                             GetApplicationEventTarget(), 0, &ref)
+            if status != noErr { failed.append("\(index)") }
             hotKeyRefs.append(ref)
         }
+        if !failed.isEmpty { log("не удалось занять Cmd+Option+: \(failed.joined(separator: ", "))") }
     }
 
     // MARK: Обновления
