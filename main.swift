@@ -16,42 +16,30 @@ let styles: [String: Style] = [
     "ABC":     Style(color: NSColor(red: 0.15, green: 0.55, blue: 1.00, alpha: 1), alpha: 0.28, label: "EN"),
 ]
 let fallbackStyle = Style(color: .systemPurple, alpha: 0.45, label: "??")
+let capsStyle = Style(color: NSColor(red: 0.95, green: 0.15, blue: 0.35, alpha: 1), alpha: 0.60, label: "CAPS")
 
 let glowHeight: CGFloat = 48     // высота полосы свечения у нижнего края
 let flashAlpha: CGFloat = 0.95   // вспышка в момент переключения
 let pillLifetime = 1.0           // сколько секунд висит плашка
+let caretDotSize: CGFloat = 10   // точка у курсора
+let caretDotLifetime = 1.2
 
 // MARK: - Поведение
 
 let maxFnTap = 0.6               // дольше держал Fn — не тап
-let doubleShiftWindow = 0.5      // окно двойного тапа Shift
+let shiftTapWindow = 0.45        // окно между тапами Shift
 let maxWordLen = 32
-
-// Дефис и апостроф внутри слова допустимы: «дабл-шифт» разбирается по частям
-let wordSeparators: Set<Character> = ["-", "'", "\u{2019}"]
-
-// Спеллчекер считает валидной любую одиночную букву, поэтому
-// однобуквенные слова разрешены только по списку
-let singleLetterWords: [String: Set<String>] = [
-    "ru": ["я", "в", "и", "к", "с", "у", "а", "о"],
-    "en": ["a", "i"],
-]
 let syntheticMagic: Int64 = 0x4C474C4F  // метка наших синтетических событий
+let releasesAPI = "https://api.github.com/repos/kzhebenev/layout-glow/releases/latest"
+let releasesPage = "https://github.com/kzhebenev/layout-glow/releases/latest"
 
-// Приложения, где автоисправление выключено по умолчанию.
-// Меняется на лету из меню («Автоисправление в …»), Termius сюда не входит.
+// Приложения, где автоисправление выключено по умолчанию (меняется в меню)
 let defaultExcludedApps = [
     "com.apple.Terminal", "com.googlecode.iterm2", "dev.warp.Warp-Stable",
     "net.kovidgoyal.kitty", "com.mitchellh.ghostty", "com.github.wez.wezterm",
 ]
 
-struct Stroke {
-    let keycode: CGKeyCode
-    let shift: Bool
-    let caps: Bool
-}
-
-// MARK: - Настройки (живут в UserDefaults, правятся из меню)
+// MARK: - Настройки
 
 final class Settings {
     static let shared = Settings()
@@ -62,8 +50,11 @@ final class Settings {
             "fnSwitch": true,
             "autoCorrect": true,
             "manualConvert": true,
+            "perAppLayout": false,
+            "capsGlow": true,
+            "caretDot": true,
             "excludedApps": defaultExcludedApps,
-            "exceptions": [String](),
+            "appLayouts": [String: String](),
         ])
     }
 
@@ -79,13 +70,25 @@ final class Settings {
         get { d.bool(forKey: "manualConvert") }
         set { d.set(newValue, forKey: "manualConvert") }
     }
+    var perAppLayout: Bool {
+        get { d.bool(forKey: "perAppLayout") }
+        set { d.set(newValue, forKey: "perAppLayout") }
+    }
+    var capsGlow: Bool {
+        get { d.bool(forKey: "capsGlow") }
+        set { d.set(newValue, forKey: "capsGlow") }
+    }
+    var caretDot: Bool {
+        get { d.bool(forKey: "caretDot") }
+        set { d.set(newValue, forKey: "caretDot") }
+    }
     var excludedApps: Set<String> {
         get { Set(d.stringArray(forKey: "excludedApps") ?? []) }
         set { d.set(Array(newValue).sorted(), forKey: "excludedApps") }
     }
-    var exceptions: Set<String> {
-        get { Set(d.stringArray(forKey: "exceptions") ?? []) }
-        set { d.set(Array(newValue).sorted(), forKey: "exceptions") }
+    var appLayouts: [String: String] {
+        get { d.dictionary(forKey: "appLayouts") as? [String: String] ?? [:] }
+        set { d.set(newValue, forKey: "appLayouts") }
     }
 
     func isExcluded(_ bundleID: String?) -> Bool {
@@ -96,129 +99,6 @@ final class Settings {
         var s = excludedApps
         if excluded { s.insert(bundleID) } else { s.remove(bundleID) }
         excludedApps = s
-    }
-    func addException(_ word: String) {
-        var s = exceptions
-        s.insert(word.lowercased())
-        exceptions = s
-    }
-}
-
-// MARK: - Раскладки
-
-func currentLayoutFullID() -> String {
-    guard let src = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
-          let ptr = TISGetInputSourceProperty(src, kTISPropertyInputSourceID) else { return "" }
-    return Unmanaged<CFString>.fromOpaque(ptr).takeUnretainedValue() as String
-}
-
-func currentLayout() -> String {
-    let id = currentLayoutFullID()
-    return id.components(separatedBy: ".").last ?? id
-}
-
-func sourceID(_ s: TISInputSource) -> String {
-    guard let p = TISGetInputSourceProperty(s, kTISPropertyInputSourceID) else { return "" }
-    return Unmanaged<CFString>.fromOpaque(p).takeUnretainedValue() as String
-}
-
-func sourceName(_ s: TISInputSource) -> String {
-    guard let p = TISGetInputSourceProperty(s, kTISPropertyLocalizedName) else { return "" }
-    return Unmanaged<CFString>.fromOpaque(p).takeUnretainedValue() as String
-}
-
-func sourceLang(_ s: TISInputSource) -> String {
-    if let p = TISGetInputSourceProperty(s, kTISPropertyInputSourceLanguages),
-       let langs = Unmanaged<CFArray>.fromOpaque(p).takeUnretainedValue() as? [String],
-       let first = langs.first { return first }
-    return "en"
-}
-
-func enabledLayouts() -> [TISInputSource] {
-    let filter = [kTISPropertyInputSourceCategory as String: kTISCategoryKeyboardInputSource as String,
-                  kTISPropertyInputSourceIsSelectCapable as String: true] as CFDictionary
-    guard let cfList = TISCreateInputSourceList(filter, false)?.takeRetainedValue() else { return [] }
-    return cfList as NSArray as! [TISInputSource]
-}
-
-func currentSource() -> TISInputSource? {
-    TISCopyCurrentKeyboardInputSource()?.takeRetainedValue()
-}
-
-func otherLayout() -> TISInputSource? {
-    let cur = currentLayoutFullID()
-    return enabledLayouts().first(where: { sourceID($0) != cur })
-}
-
-// Что дадут эти клавиши в указанной раскладке
-func translate(_ strokes: [Stroke], via source: TISInputSource) -> String {
-    guard let dataPtr = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) else { return "" }
-    let data = Unmanaged<CFData>.fromOpaque(dataPtr).takeUnretainedValue() as Data
-    return data.withUnsafeBytes { buf -> String in
-        guard let layout = buf.bindMemory(to: UCKeyboardLayout.self).baseAddress else { return "" }
-        var result = ""
-        var deadKeys: UInt32 = 0
-        for s in strokes {
-            var chars = [UniChar](repeating: 0, count: 4)
-            var length = 0
-            UCKeyTranslate(layout, s.keycode, UInt16(kUCKeyActionDown),
-                           s.shift ? (UInt32(shiftKey) >> 8) & 0xFF : 0,
-                           UInt32(LMGetKbdType()), UInt32(kUCKeyTranslateNoDeadKeysBit),
-                           &deadKeys, 4, &length, &chars)
-            var piece = String(utf16CodeUnits: chars, count: length)
-            if s.caps && !s.shift { piece = piece.uppercased() }
-            result += piece
-        }
-        return result
-    }
-}
-
-// Посимвольная карта одной раскладки в другую (для конвертации выделенного текста)
-func charMap(from a: TISInputSource, to b: TISInputSource) -> [Character: Character] {
-    var map = [Character: Character]()
-    for code in 0...50 {
-        for shift in [false, true] {
-            let s = [Stroke(keycode: CGKeyCode(code), shift: shift, caps: false)]
-            let from = translate(s, via: a)
-            let to = translate(s, via: b)
-            if let cf = from.first, let ct = to.first,
-               from.count == 1, to.count == 1, cf != ct {
-                map[cf] = ct
-            }
-        }
-    }
-    return map
-}
-
-func isValidWord(_ word: String, lang: String) -> Bool {
-    guard !word.isEmpty else { return false }
-    let r = NSSpellChecker.shared.checkSpelling(of: word, startingAt: 0, language: lang,
-                                                wrap: false, inSpellDocumentWithTag: 0, wordCount: nil)
-    return r.location == NSNotFound
-}
-
-// Буквы, между которыми допустимы дефис и апостроф
-func isWordLike(_ s: String) -> Bool {
-    guard let first = s.first, let last = s.last, first.isLetter, last.isLetter,
-          s.allSatisfy({ $0.isLetter || wordSeparators.contains($0) }) else { return false }
-    return true
-}
-
-func wordParts(_ s: String) -> [String] {
-    s.split(whereSeparator: { wordSeparators.contains($0) }).map(String.init)
-}
-
-// Осмысленно ли это на данном языке: каждая часть — словарное слово,
-// а однобуквенные — только из списка
-func meaningful(_ s: String, lang: String) -> Bool {
-    let base = String(lang.prefix(2)).lowercased()
-    let parts = wordParts(s)
-    guard !parts.isEmpty else { return false }
-    return parts.allSatisfy { part in
-        if part.count == 1 {
-            return singleLetterWords[base]?.contains(part.lowercased()) ?? false
-        }
-        return isValidWord(part, lang: lang)
     }
 }
 
@@ -238,6 +118,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var glowWindows: [NSWindow] = []
     var pillWindow: NSWindow?
     var pillTimer: Timer?
+    var caretWindow: NSWindow?
+    var caretTimer: Timer?
     var lastLayout = ""
     var statusItem: NSStatusItem?
 
@@ -246,6 +128,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var fnUsedAsModifier = false
     var fnDownAt: TimeInterval = 0
     var accessRequested = false
+    var capsOn = false
 
     var wordBuffer: [Stroke] = []
     var lastWord: [Stroke]?
@@ -253,14 +136,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var shiftDown = false
     var shiftUsedAsModifier = false
     var lastShiftTapAt: TimeInterval = 0
+    var shiftTapCount = 0
+    var pendingConvert: DispatchWorkItem?
     var replaceInProgress = false
-    var lastAutoTyped: String?          // что автоисправление заменило (для самообучения)
-    var frontApp: NSRunningApplication? // последнее не наше активное приложение
+    var lastAutoTyped: String?
+    var frontApp: NSRunningApplication?
+    var restoringLayout = false
 
-    // Диагностика: пишется в ~/Library/Application Support/LayoutGlow/status.log
+    var hotKeyRefs: [EventHotKeyRef?] = []
+
+    let exceptionsFile = WordFile(name: "exceptions.txt", header: exceptionsHeader)
+    let commandsFile = WordFile(name: "commands.txt", header: commandsHeader, defaults: defaultCommands)
+    let snippetsFile = SnippetFile(name: "snippets.txt", header: "", defaults: defaultSnippets)
+
+    // Диагностика
     var keysSeen = 0
     var shiftTaps = 0
-    var doubleShifts = 0
     var events: [String] = []
 
     func applicationDidFinishLaunching(_ note: Notification) {
@@ -271,6 +162,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         buildGlowWindows()
         buildStatusItem()
+        capsOn = NSEvent.modifierFlags.contains(.capsLock)
         apply(layout: currentLayout(), animated: false)
 
         DistributedNotificationCenter.default().addObserver(
@@ -285,19 +177,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         frontApp = NSWorkspace.shared.frontmostApplication
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] n in
-            guard let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
-            if app.bundleIdentifier != Bundle.main.bundleIdentifier { self?.frontApp = app }
-            self?.wordBuffer.removeAll()
-            self?.lastWord = nil
+            guard let self,
+                  let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+            if app.bundleIdentifier != Bundle.main.bundleIdentifier {
+                self.frontApp = app
+                self.restoreLayout(for: app)
+            }
+            self.wordBuffer.removeAll()
+            self.lastWord = nil
         }
 
         Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             guard let self else { return }
             let now = currentLayout()
             if now != self.lastLayout { self.apply(layout: now, animated: true) }
+            self.exceptionsFile.reload()
+            self.commandsFile.reload()
+            self.snippetsFile.reload()
         }
 
         startTap()
+        registerSlotHotkeys()
         AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.4)
         Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.writeStatus() }
         writeStatus()
@@ -306,6 +206,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
             AXIsProcessTrustedWithOptions(opts)
         }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self.checkForUpdates(manual: false) }
     }
 
     // MARK: Окна свечения
@@ -337,11 +238,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func layoutChanged() {
         let now = currentLayout()
         if now != lastLayout { apply(layout: now, animated: true) }
+        rememberLayout()
+    }
+
+    func currentStyle() -> Style {
+        if capsOn && Settings.shared.capsGlow { return capsStyle }
+        return styles[lastLayout] ?? fallbackStyle
     }
 
     func apply(layout: String, animated: Bool) {
         lastLayout = layout
-        let style = styles[layout] ?? fallbackStyle
+        refreshGlow(animated: animated)
+        if animated {
+            let style = currentStyle()
+            showPill(text: style.label, color: style.color)
+            showCaretDot(color: style.color)
+        }
+    }
+
+    func refreshGlow(animated: Bool) {
+        let style = currentStyle()
         statusItem?.button?.title = style.label
         for w in glowWindows {
             (w.contentView as? GlowView)?.color = style.color
@@ -355,7 +271,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 w.alphaValue = style.alpha
             }
         }
-        if animated { showPill(text: style.label, color: style.color) }
     }
 
     func showPill(text: String, color: NSColor) {
@@ -368,14 +283,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let rect = NSRect(x: f.midX - size.width / 2, y: f.minY + 96,
                           width: size.width, height: size.height)
 
-        let w = NSWindow(contentRect: rect, styleMask: .borderless, backing: .buffered, defer: false)
-        w.isOpaque = false
-        w.backgroundColor = .clear
-        w.hasShadow = false
-        w.ignoresMouseEvents = true
-        w.level = .screenSaver
-        w.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
-
+        let w = borderlessWindow(rect: rect)
         let view = NSView(frame: NSRect(origin: .zero, size: size))
         view.wantsLayer = true
         view.layer?.backgroundColor = color.withAlphaComponent(0.9).cgColor
@@ -404,6 +312,98 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    func borderlessWindow(rect: NSRect) -> NSWindow {
+        let w = NSWindow(contentRect: rect, styleMask: .borderless, backing: .buffered, defer: false)
+        w.isOpaque = false
+        w.backgroundColor = .clear
+        w.hasShadow = false
+        w.ignoresMouseEvents = true
+        w.level = .screenSaver
+        w.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        return w
+    }
+
+    // MARK: Точка у курсора
+
+    // Положение каретки через Универсальный доступ; работает не во всех приложениях
+    func caretRect() -> CGRect? {
+        guard AXIsProcessTrusted() else { return nil }
+        let system = AXUIElementCreateSystemWide()
+        var focusedRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
+              let f = focusedRef, CFGetTypeID(f) == AXUIElementGetTypeID() else { return nil }
+        let element = f as! AXUIElement
+
+        var rangeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success,
+              let rv = rangeRef, CFGetTypeID(rv) == AXValueGetTypeID() else { return nil }
+        var range = CFRange()
+        AXValueGetValue(rv as! AXValue, .cfRange, &range)
+        range.length = 0
+
+        guard let rangeValue = AXValueCreate(.cfRange, &range) else { return nil }
+        var boundsRef: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(
+                element, kAXBoundsForRangeParameterizedAttribute as CFString,
+                rangeValue, &boundsRef) == .success,
+              let bv = boundsRef, CFGetTypeID(bv) == AXValueGetTypeID() else { return nil }
+        var rect = CGRect.zero
+        AXValueGetValue(bv as! AXValue, .cgRect, &rect)
+        guard rect.width.isFinite, rect.height.isFinite, rect.height > 0 else { return nil }
+        return rect
+    }
+
+    func showCaretDot(color: NSColor) {
+        guard Settings.shared.caretDot, let rect = caretRect(),
+              let primary = NSScreen.screens.first else { return }
+        caretTimer?.invalidate()
+        caretWindow?.orderOut(nil)
+
+        // Универсальный доступ отдаёт координаты от левого верхнего угла
+        let flippedY = primary.frame.maxY - rect.maxY
+        let origin = NSPoint(x: rect.minX - caretDotSize - 4, y: flippedY + rect.height / 2 - caretDotSize / 2)
+        let w = borderlessWindow(rect: NSRect(origin: origin, size: NSSize(width: caretDotSize, height: caretDotSize)))
+
+        let view = NSView(frame: NSRect(x: 0, y: 0, width: caretDotSize, height: caretDotSize))
+        view.wantsLayer = true
+        view.layer?.backgroundColor = color.cgColor
+        view.layer?.cornerRadius = caretDotSize / 2
+        w.contentView = view
+        w.alphaValue = 0.95
+        w.orderFrontRegardless()
+        caretWindow = w
+
+        caretTimer = Timer.scheduledTimer(withTimeInterval: caretDotLifetime, repeats: false) { [weak self] _ in
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.3
+                w.animator().alphaValue = 0
+            }, completionHandler: {
+                w.orderOut(nil)
+                if self?.caretWindow === w { self?.caretWindow = nil }
+            })
+        }
+    }
+
+    // MARK: Раскладка для каждого приложения
+
+    func rememberLayout() {
+        guard Settings.shared.perAppLayout, !restoringLayout,
+              let bid = frontApp?.bundleIdentifier else { return }
+        var map = Settings.shared.appLayouts
+        map[bid] = currentLayoutFullID()
+        Settings.shared.appLayouts = map
+    }
+
+    func restoreLayout(for app: NSRunningApplication) {
+        guard Settings.shared.perAppLayout, let bid = app.bundleIdentifier,
+              let wanted = Settings.shared.appLayouts[bid], wanted != currentLayoutFullID(),
+              let source = layout(withID: wanted) else { return }
+        restoringLayout = true
+        TISSelectInputSource(source)
+        log("раскладка для «\(appName(for: bid))»: \(wanted.components(separatedBy: ".").last ?? wanted)")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.restoringLayout = false }
+    }
+
     // MARK: Диагностика
 
     func log(_ line: String) {
@@ -413,31 +413,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func writeStatus() {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("LayoutGlow")
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let fnUsage = CFPreferencesCopyAppValue("AppleFnUsageType" as CFString,
                                                 "com.apple.HIToolbox" as CFString) as? Int ?? -1
         var text = """
         перехват клавиатуры: \(eventTap != nil ? "работает" : "НЕТ (нужен Мониторинг ввода)")
         универсальный доступ: \(AXIsProcessTrusted() ? "выдан" : "НЕ ВЫДАН")
         нажатий получено: \(keysSeen)
-        тапов Shift: \(shiftTaps), из них двойных: \(doubleShifts)
+        тапов Shift: \(shiftTaps)
         в буфере слова: \(wordBuffer.count) симв.
         AppleFnUsageType: \(fnUsage) (0 = Do Nothing, тап Fn наш)
-        раскладка: \(lastLayout)
+        раскладка: \(lastLayout), Caps Lock: \(capsOn ? "включён" : "выключен")
         активное приложение: \(frontApp?.bundleIdentifier ?? "—")
-        автоисправление: \(Settings.shared.autoCorrect), двойной Shift: \(Settings.shared.manualConvert)
+        словари: исключений \(exceptionsFile.words.count), команд \(commandsFile.words.count), вставок \(snippetsFile.items.count)
+        раскладка по приложениям: \(Settings.shared.perAppLayout ? "вкл" : "выкл")
 
         события:
         """
         text += "\n" + events.joined(separator: "\n") + "\n"
-        try? text.write(to: dir.appendingPathComponent("status.log"), atomically: true, encoding: .utf8)
+        try? text.write(to: supportDirectory().appendingPathComponent("status.log"),
+                        atomically: true, encoding: .utf8)
     }
 
     // MARK: Меню-бар
 
-    // Имена приложений, которые могут быть не установлены на этом маке
     static let knownAppNames: [String: String] = [
         "com.apple.Terminal": "Terminal",
         "com.googlecode.iterm2": "iTerm2",
@@ -479,25 +477,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(withTitle: "Раскладка: \(layoutName)", action: nil, keyEquivalent: "")
         menu.addItem(.separator())
 
-        func toggle(_ title: String, _ on: Bool, _ selector: Selector) {
+        func toggle(_ title: String, _ on: Bool, _ selector: Selector, in target: NSMenu? = nil) {
             let i = NSMenuItem(title: title, action: selector, keyEquivalent: "")
             i.state = on ? .on : .off
             i.target = self
-            menu.addItem(i)
+            (target ?? menu).addItem(i)
         }
         toggle("Быстрое переключение по Fn", s.fnSwitch, #selector(toggleFn))
         toggle("Автоисправление раскладки", s.autoCorrect, #selector(toggleAuto))
         toggle("Конвертация по двойному Shift", s.manualConvert, #selector(toggleManual))
+        toggle("Своя раскладка для каждого приложения", s.perAppLayout, #selector(togglePerApp))
+        toggle("Подсветка Caps Lock", s.capsGlow, #selector(toggleCaps))
+        toggle("Точка у курсора", s.caretDot, #selector(toggleCaret))
 
         menu.addItem(.separator())
         if let app = frontApp, let bid = app.bundleIdentifier {
             let name = app.localizedName ?? appName(for: bid)
             toggle("Автоисправление в «\(name)»", !s.isExcluded(bid), #selector(toggleFrontApp))
         }
-        // Показываем только то, что реально установлено: список по умолчанию
-        // содержит терминалы, которых на этом маке может не быть
         let excluded = s.excludedApps.filter { isInstalled($0) }.sorted { appName(for: $0) < appName(for: $1) }
         if !excluded.isEmpty {
+            let head = NSMenuItem(title: "Выключено в приложениях (\(excluded.count))", action: nil, keyEquivalent: "")
+            menu.addItem(head)
             let sub = NSMenu()
             for bid in excluded {
                 let i = NSMenuItem(title: appName(for: bid), action: #selector(removeExcludedApp(_:)), keyEquivalent: "")
@@ -506,52 +507,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 i.toolTip = "\(bid) — нажмите, чтобы включить автоисправление здесь"
                 sub.addItem(i)
             }
-            let head = NSMenuItem(title: "Выключено в приложениях (\(excluded.count))", action: nil, keyEquivalent: "")
-            menu.addItem(head)
             menu.setSubmenu(sub, for: head)
         }
 
         menu.addItem(.separator())
-        let words = s.exceptions.sorted()
-        let exHead = NSMenuItem(title: "Слова-исключения (\(words.count))", action: nil, keyEquivalent: "")
-        menu.addItem(exHead)
-        if !words.isEmpty {
+        let dictHead = NSMenuItem(title: "Словари", action: nil, keyEquivalent: "")
+        menu.addItem(dictHead)
+        let dicts = NSMenu()
+        func fileItem(_ title: String, _ selector: Selector) {
+            let i = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+            i.target = self
+            dicts.addItem(i)
+        }
+        fileItem("Исключения (\(exceptionsFile.words.count))…", #selector(openExceptions))
+        fileItem("Системные команды (\(commandsFile.words.count))…", #selector(openCommands))
+        fileItem("Вставки (\(snippetsFile.items.count))…", #selector(openSnippets))
+        dicts.addItem(.separator())
+        let reload = NSMenuItem(title: "Перечитать словари", action: #selector(reloadDictionaries), keyEquivalent: "")
+        reload.target = self
+        dicts.addItem(reload)
+        menu.setSubmenu(dicts, for: dictHead)
+
+        // Слоты вставок Cmd+Option+цифра
+        let slots = (1...9).compactMap { n -> (Int, String)? in
+            guard let v = snippetsFile.value(for: String(n)) else { return nil }
+            return (n, v)
+        }
+        if !slots.isEmpty {
+            let head = NSMenuItem(title: "Быстрые вставки (\(slots.count))", action: nil, keyEquivalent: "")
+            menu.addItem(head)
             let sub = NSMenu()
-            for w in words {
-                let i = NSMenuItem(title: w, action: #selector(removeException(_:)), keyEquivalent: "")
+            for (n, value) in slots {
+                let short = value.count > 40 ? String(value.prefix(40)) + "…" : value
+                let i = NSMenuItem(title: "\(n): \(short)", action: #selector(insertSlotItem(_:)), keyEquivalent: "")
                 i.target = self
-                i.representedObject = w
+                i.representedObject = n
+                i.toolTip = "Cmd+Option+\(n)"
                 sub.addItem(i)
             }
-            sub.addItem(.separator())
-            let clear = NSMenuItem(title: "Очистить список", action: #selector(clearExceptions), keyEquivalent: "")
-            clear.target = self
-            sub.addItem(clear)
-            menu.setSubmenu(sub, for: exHead)
+            menu.setSubmenu(sub, for: head)
         }
 
         menu.addItem(.separator())
-        let inputOK = eventTap != nil
-        let axOK = AXIsProcessTrusted()
-        let i1 = NSMenuItem(title: "Мониторинг ввода: \(inputOK ? "выдан" : "НЕ ВЫДАН")",
+        let i1 = NSMenuItem(title: "Мониторинг ввода: \(eventTap != nil ? "выдан" : "НЕ ВЫДАН")",
                             action: #selector(openInputMonitoring), keyEquivalent: "")
         i1.target = self
         menu.addItem(i1)
-        let i2 = NSMenuItem(title: "Универсальный доступ: \(axOK ? "выдан" : "НЕ ВЫДАН")",
+        let i2 = NSMenuItem(title: "Универсальный доступ: \(AXIsProcessTrusted() ? "выдан" : "НЕ ВЫДАН")",
                             action: #selector(openAccessibility), keyEquivalent: "")
         i2.target = self
         menu.addItem(i2)
 
         menu.addItem(.separator())
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
-        menu.addItem(withTitle: "LayoutGlow \(version)", action: nil, keyEquivalent: "")
-        let quit = NSMenuItem(title: "Выйти", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        menu.addItem(quit)
+        let upd = NSMenuItem(title: "LayoutGlow \(version) — проверить обновления",
+                             action: #selector(checkUpdatesManually), keyEquivalent: "")
+        upd.target = self
+        menu.addItem(upd)
+        menu.addItem(NSMenuItem(title: "Выйти", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     }
 
     @objc func toggleFn() { Settings.shared.fnSwitch.toggle() }
     @objc func toggleAuto() { Settings.shared.autoCorrect.toggle() }
     @objc func toggleManual() { Settings.shared.manualConvert.toggle() }
+    @objc func togglePerApp() {
+        Settings.shared.perAppLayout.toggle()
+        if Settings.shared.perAppLayout { rememberLayout() }
+    }
+    @objc func toggleCaps() { Settings.shared.capsGlow.toggle(); refreshGlow(animated: false) }
+    @objc func toggleCaret() { Settings.shared.caretDot.toggle() }
     @objc func toggleFrontApp() {
         guard let bid = frontApp?.bundleIdentifier else { return }
         Settings.shared.setExcluded(bid, !Settings.shared.isExcluded(bid))
@@ -560,19 +584,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let bid = sender.representedObject as? String else { return }
         Settings.shared.setExcluded(bid, false)
     }
-    @objc func removeException(_ sender: NSMenuItem) {
-        guard let w = sender.representedObject as? String else { return }
-        var s = Settings.shared.exceptions
-        s.remove(w)
-        Settings.shared.exceptions = s
+    @objc func openExceptions() { NSWorkspace.shared.open(exceptionsFile.url) }
+    @objc func openCommands() { NSWorkspace.shared.open(commandsFile.url) }
+    @objc func openSnippets() { NSWorkspace.shared.open(snippetsFile.url) }
+    @objc func reloadDictionaries() {
+        exceptionsFile.reload(force: true)
+        commandsFile.reload(force: true)
+        snippetsFile.reload(force: true)
+        showPill(text: "словари", color: .systemGray)
     }
-    @objc func clearExceptions() { Settings.shared.exceptions = [] }
+    @objc func insertSlotItem(_ sender: NSMenuItem) {
+        guard let n = sender.representedObject as? Int else { return }
+        insertSlot(n)
+    }
     @objc func openInputMonitoring() {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")!)
     }
     @objc func openAccessibility() {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
     }
+    @objc func checkUpdatesManually() { checkForUpdates(manual: true) }
 
     // MARK: Перехват клавиатуры
 
@@ -616,6 +647,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         let keycode = event.getIntegerValueField(.keyboardEventKeycode)
+        let caps = event.flags.contains(.maskAlphaShift)
+        if caps != capsOn {
+            capsOn = caps
+            DispatchQueue.main.async {
+                self.refreshGlow(animated: true)
+                if Settings.shared.capsGlow {
+                    let st = self.currentStyle()
+                    self.showPill(text: st.label, color: st.color)
+                }
+            }
+        }
+
         switch type {
         case .flagsChanged where keycode == 63:  // Fn/Globe
             if shiftDown { shiftUsedAsModifier = true }
@@ -639,19 +682,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 shiftUsedAsModifier = false
             } else if !pressed && shiftDown {
                 shiftDown = false
-                let now = ProcessInfo.processInfo.systemUptime
-                if Settings.shared.manualConvert && !shiftUsedAsModifier {
-                    shiftTaps += 1
-                    if now - lastShiftTapAt < doubleShiftWindow {
-                        lastShiftTapAt = 0
-                        doubleShifts += 1
-                        DispatchQueue.main.async { self.manualConvert() }
-                    } else {
-                        lastShiftTapAt = now
-                    }
-                } else {
-                    lastShiftTapAt = 0
-                }
+                if !shiftUsedAsModifier { handleShiftTap() }
+                else { shiftTapCount = 0; pendingConvert?.cancel() }
             }
         case .flagsChanged:
             if fnDown { fnUsedAsModifier = true }
@@ -659,14 +691,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .keyDown:
             if fnDown { fnUsedAsModifier = true }
             if shiftDown { shiftUsedAsModifier = true }
+            shiftTapCount = 0
+            pendingConvert?.cancel()
             trackKey(event: event, keycode: keycode)
         default:
             break
         }
     }
 
+    // Двойной тап — конвертация, тройной — вставка по ключу
+    func handleShiftTap() {
+        guard Settings.shared.manualConvert else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        shiftTaps += 1
+        shiftTapCount = (now - lastShiftTapAt < shiftTapWindow) ? shiftTapCount + 1 : 1
+        lastShiftTapAt = now
+        pendingConvert?.cancel()
+
+        if shiftTapCount == 2 {
+            // ждём, не будет ли третьего тапа
+            let work = DispatchWorkItem { [weak self] in
+                self?.shiftTapCount = 0
+                self?.manualConvert()
+            }
+            pendingConvert = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + shiftTapWindow, execute: work)
+        } else if shiftTapCount >= 3 {
+            shiftTapCount = 0
+            DispatchQueue.main.async { self.expandSnippet() }
+        }
+    }
+
     func toggleLayout() {
-        // Пока системный «Press Globe key to» не в «Do Nothing», не дублируем систему
         if let v = CFPreferencesCopyAppValue("AppleFnUsageType" as CFString,
                                              "com.apple.HIToolbox" as CFString) as? Int, v != 0 {
             return
@@ -707,40 +763,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let stroke = Stroke(keycode: CGKeyCode(keycode), shift: flags.contains(.maskShift),
                                 caps: flags.contains(.maskAlphaShift))
             if let cur = currentSource(), !translate([stroke], via: cur).isEmpty {
-                wordBuffer.append(stroke)
                 keysSeen += 1
-            if wordBuffer.count > maxWordLen { wordBuffer.removeAll(); lastWord = nil }
+                wordBuffer.append(stroke)
+                if wordBuffer.count > maxWordLen { wordBuffer.removeAll(); lastWord = nil }
             }
         }
     }
 
     func autoCorrect(_ word: [Stroke]) {
-        guard !word.isEmpty,
-              let cur = currentSource(), let other = otherLayout() else { return }
+        guard !word.isEmpty, let cur = currentSource(), let other = otherLayout() else { return }
         if Settings.shared.isExcluded(frontApp?.bundleIdentifier) { return }
 
         let typed = translate(word, via: cur)
-        defer { writeStatus() }
-        let capsOn = word.contains(where: { $0.caps })
-        // Аббревиатура (HD, СКЗИ): всё заглавными и Caps Lock не был включён
-        if !capsOn, typed.rangeOfCharacter(from: .letters) != nil, typed == typed.uppercased() { return }
-        if Settings.shared.exceptions.contains(typed.lowercased()) { return }
-
         let converted = translate(word, via: other)
-        let srcLang = sourceLang(cur), dstLang = sourceLang(other)
-        guard isWordLike(converted) else {
-            log("пропуск «\(typed)»: не слово целиком")
-            return
-        }
-        guard !meaningful(typed, lang: srcLang) else {
-            log("пропуск «\(typed)»: валидно в \(srcLang)")
-            return
-        }
-        guard meaningful(converted, lang: dstLang) else {
-            log("пропуск «\(typed)»: «\(converted)» невалидно в \(dstLang)")
-            return
-        }
+        let decision = correctionDecision(
+            typed: typed, converted: converted,
+            srcLang: sourceLang(cur), dstLang: sourceLang(other),
+            commands: commandsFile.words, exceptions: exceptionsFile.words,
+            capsOn: word.contains(where: { $0.caps }))
 
+        guard decision.correct else {
+            log("пропуск «\(typed)»: \(decision.reason)")
+            return
+        }
         log("исправлено «\(typed)» -> «\(converted)»")
         lastAutoTyped = typed
         performReplace(strokes: word, trailingSpaces: 1, to: other)
@@ -748,10 +793,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         lastWordTrailing = 1
     }
 
-    // MARK: Ручная конвертация (двойной Shift)
+    // MARK: Ручная конвертация и вставки
 
     func manualConvert() {
-        // Сначала пробуем выделенный текст — конвертируем его целиком
         if convertSelection() { log("двойной Shift: конвертирован выделенный текст"); return }
 
         guard let other = otherLayout() else { log("двойной Shift: нет второй раскладки"); return }
@@ -765,24 +809,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             log("двойной Shift: нечего конвертировать (буфер пуст)")
             return
         }
-        log("двойной Shift: «\(currentSource().map { translate(strokes, via: $0) } ?? "")» -> «\(translate(strokes, via: other))»")
 
         // Откат автоисправления = слово уходит в исключения (самообучение)
-        if let typed = lastAutoTyped, let cur = currentSource(),
-           translate(strokes, via: other) == typed {
-            Settings.shared.addException(typed)
+        if let typed = lastAutoTyped, translate(strokes, via: other) == typed {
+            exceptionsFile.add(typed)
             lastAutoTyped = nil
-            _ = cur
+            log("«\(typed)» добавлено в исключения")
             showPill(text: "искл.", color: .systemGray)
         }
 
+        log("двойной Shift: «\(currentSource().map { translate(strokes, via: $0) } ?? "")» -> «\(translate(strokes, via: other))»")
         performReplace(strokes: strokes, trailingSpaces: trailing, to: other)
         wordBuffer.removeAll()
         lastWord = strokes
         lastWordTrailing = trailing
     }
 
-    // Конвертация выделенного текста через Универсальный доступ, с запасным путём через буфер обмена
+    // Тройной Shift: набранный ключ заменяется текстом из словаря вставок
+    func expandSnippet() {
+        guard !wordBuffer.isEmpty, let cur = currentSource() else {
+            log("тройной Shift: ключ не набран")
+            return
+        }
+        let typed = translate(wordBuffer, via: cur)
+        var value = snippetsFile.value(for: typed)
+        if value == nil, let other = otherLayout() {
+            // ключ мог быть набран не в той раскладке
+            value = snippetsFile.value(for: translate(wordBuffer, via: other))
+        }
+        guard let text = value else {
+            log("тройной Shift: нет вставки для «\(typed)»")
+            showPill(text: "нет «\(typed)»", color: .systemGray)
+            return
+        }
+        log("вставка по ключу «\(typed)»")
+        let count = wordBuffer.count
+        wordBuffer.removeAll()
+        lastWord = nil
+        replaceWithText(backspaces: count, text: text)
+    }
+
+    func insertSlot(_ number: Int) {
+        guard let text = snippetsFile.value(for: String(number)) else {
+            log("слот \(number): пусто")
+            return
+        }
+        log("вставка из слота \(number)")
+        replaceWithText(backspaces: 0, text: text)
+    }
+
+    // Конвертация выделенного текста через Универсальный доступ, запасной путь — буфер обмена
     func convertSelection() -> Bool {
         guard AXIsProcessTrusted() else { return false }
         let system = AXUIElementCreateSystemWide()
@@ -802,7 +878,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return true
         }
 
-        // Запасной путь: вставка через буфер обмена
         let pb = NSPasteboard.general
         let saved = pb.string(forType: .string)
         pb.clearContents()
@@ -821,7 +896,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return true
     }
 
-    // Определяем направление по содержимому и конвертируем текст посимвольно
     func convertText(_ text: String) -> (String, TISInputSource)? {
         let layouts = enabledLayouts()
         guard layouts.count > 1 else { return nil }
@@ -835,11 +909,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let target = layouts.first(where: { sourceLang($0).hasPrefix(wantLang) }),
               let from = layouts.first(where: { sourceID($0) != sourceID(target) }) else { return nil }
         let map = charMap(from: from, to: target)
-        let converted = String(text.map { map[$0] ?? $0 })
-        return (converted, target)
+        return (String(text.map { map[$0] ?? $0 }), target)
     }
 
-    // MARK: Перепечатка
+    // MARK: Синтетический ввод
 
     func postKey(_ keycode: CGKeyCode, flags: CGEventFlags = []) {
         for down in [true, false] {
@@ -851,13 +924,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    func performReplace(strokes: [Stroke], trailingSpaces: Int, to target: TISInputSource) {
-        guard !replaceInProgress else { return }
-        guard AXIsProcessTrusted() else {
-            let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-            AXIsProcessTrustedWithOptions(opts)
-            return
+    func postText(_ text: String) {
+        let utf16 = Array(text.utf16)
+        for down in [true, false] {
+            guard let e = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: down) else { continue }
+            e.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: utf16)
+            e.setIntegerValueField(.eventSourceUserData, value: syntheticMagic)
+            e.post(tap: .cgSessionEventTap)
+            usleep(1500)
         }
+    }
+
+    func ensureAccessibility() -> Bool {
+        if AXIsProcessTrusted() { return true }
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        AXIsProcessTrustedWithOptions(opts)
+        return false
+    }
+
+    func replaceWithText(backspaces: Int, text: String) {
+        guard !replaceInProgress, ensureAccessibility() else { return }
+        replaceInProgress = true
+        DispatchQueue.global(qos: .userInteractive).async {
+            for _ in 0..<backspaces { self.postKey(51) }
+            if backspaces > 0 { usleep(20000) }
+            self.postText(text)
+            DispatchQueue.main.async { self.replaceInProgress = false }
+        }
+    }
+
+    func performReplace(strokes: [Stroke], trailingSpaces: Int, to target: TISInputSource) {
+        guard !replaceInProgress, ensureAccessibility() else { return }
         replaceInProgress = true
         let total = strokes.count + trailingSpaces
         DispatchQueue.global(qos: .userInteractive).async {
@@ -874,6 +971,126 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             for _ in 0..<trailingSpaces { self.postKey(49) }
             DispatchQueue.main.async { self.replaceInProgress = false }
         }
+    }
+
+    // MARK: Горячие клавиши слотов (Cmd+Option+1...9)
+
+    func registerSlotHotkeys() {
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, event, userData in
+            guard let event, let userData else { return noErr }
+            var hkID = EventHotKeyID()
+            GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                              nil, MemoryLayout<EventHotKeyID>.size, nil, &hkID)
+            let me = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
+            DispatchQueue.main.async { me.insertSlot(Int(hkID.id)) }
+            return noErr
+        }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), nil)
+
+        let digitKeycodes: [UInt32] = [18, 19, 20, 21, 23, 22, 26, 28, 25]  // 1...9
+        for (index, keycode) in digitKeycodes.enumerated() {
+            var ref: EventHotKeyRef?
+            let id = EventHotKeyID(signature: OSType(0x4C474C4F), id: UInt32(index + 1))
+            RegisterEventHotKey(keycode, UInt32(cmdKey | optionKey), id, GetApplicationEventTarget(), 0, &ref)
+            hotKeyRefs.append(ref)
+        }
+    }
+
+    // MARK: Обновления
+
+    func checkForUpdates(manual: Bool) {
+        guard let url = URL(string: releasesAPI) else { return }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 10
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+            guard let self else { return }
+            guard let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let tag = json["tag_name"] as? String else {
+                if manual {
+                    DispatchQueue.main.async {
+                        self.alert("Не удалось проверить обновления",
+                                   "Страница релизов недоступна. Возможно, нет сети или репозиторий закрыт.")
+                    }
+                }
+                return
+            }
+            let latest = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+            let current = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
+            let newer = latest.compare(current, options: .numeric) == .orderedDescending
+            let assets = json["assets"] as? [[String: Any]] ?? []
+            let dmg = assets.first { ($0["name"] as? String)?.hasSuffix(".dmg") == true }
+            let dmgURL = dmg?["browser_download_url"] as? String
+
+            DispatchQueue.main.async {
+                if !newer {
+                    if manual { self.alert("Обновлений нет", "Установлена последняя версия \(current).") }
+                    return
+                }
+                let ok = self.confirm("Доступна версия \(latest)",
+                                      "Установлена \(current). Обновить сейчас? Приложение перезапустится.")
+                if ok, let dmgURL { self.downloadAndInstall(dmgURL) }
+                else if ok { NSWorkspace.shared.open(URL(string: releasesPage)!) }
+            }
+        }.resume()
+    }
+
+    func downloadAndInstall(_ urlString: String) {
+        guard let url = URL(string: urlString) else { return }
+        log("загрузка обновления: \(urlString)")
+        URLSession.shared.downloadTask(with: url) { [weak self] tmp, _, error in
+            guard let self else { return }
+            guard let tmp, error == nil else {
+                DispatchQueue.main.async { self.alert("Не удалось скачать обновление", error?.localizedDescription ?? "") }
+                return
+            }
+            let dmg = FileManager.default.temporaryDirectory.appendingPathComponent("LayoutGlow-update.dmg")
+            try? FileManager.default.removeItem(at: dmg)
+            try? FileManager.default.moveItem(at: tmp, to: dmg)
+
+            let script = """
+            set -e
+            MP=$(mktemp -d)
+            hdiutil attach -nobrowse -quiet -mountpoint "$MP" "\(dmg.path)"
+            rm -rf "/Applications/LayoutGlow.app"
+            cp -R "$MP/LayoutGlow.app" /Applications/
+            hdiutil detach -quiet "$MP" || true
+            rm -f "\(dmg.path)"
+            sleep 1
+            open -a /Applications/LayoutGlow.app
+            """
+            let path = FileManager.default.temporaryDirectory.appendingPathComponent("layoutglow-update.sh")
+            try? script.write(to: path, atomically: true, encoding: .utf8)
+
+            DispatchQueue.main.async {
+                let task = Process()
+                task.executableURL = URL(fileURLWithPath: "/bin/bash")
+                task.arguments = [path.path]
+                do {
+                    try task.run()
+                    NSApp.terminate(nil)
+                } catch {
+                    self.alert("Не удалось установить обновление", error.localizedDescription)
+                }
+            }
+        }.resume()
+    }
+
+    func alert(_ title: String, _ text: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = text
+        a.runModal()
+    }
+
+    func confirm(_ title: String, _ text: String) -> Bool {
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = text
+        a.addButton(withTitle: "Обновить")
+        a.addButton(withTitle: "Позже")
+        return a.runModal() == .alertFirstButtonReturn
     }
 }
 
