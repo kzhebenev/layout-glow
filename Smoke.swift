@@ -39,6 +39,11 @@ final class SmokeTest {
                  input: "ghbdtn,", expected: "ghbdtn,", doubleShift: false),
         Scenario(name: "конвертация двойным Shift", language: "en",
                  input: "rjirf", expected: "кошка", doubleShift: true),
+        // После исправления раскладка становится русской, и те же клавиши
+        // дают русские буквы. Если автопереключение влезет в набор,
+        // слово развалится — так и появлялось «[очу» вместо «хочу»
+        Scenario(name: "слово сразу после исправления", language: "en",
+                 input: "lf |ghbdtn ", expected: "да привет ", doubleShift: false),
     ]
 
     // Расширенный прогон: те же сценарии, но в настоящем приложении.
@@ -210,10 +215,12 @@ final class SmokeTest {
             window.makeFirstResponder(field)
             delegate.wordBuffer.removeAll()
             delegate.lastWord = nil
-            return scenario.input.map { character in
-                character == " "
-                    ? Stroke(keycode: 49, shift: false, caps: false)
-                    : (stroke(for: character, in: layout) ?? Stroke(keycode: 49, shift: false, caps: false))
+            // «|» в сценарии означает паузу: человек не набирает слово
+            // за двести миллисекунд, а тесту важно дать исправлению сработать
+            return scenario.input.map { character -> Stroke in
+                if character == "|" { return Stroke(keycode: 999, shift: false, caps: false) }
+                if character == " " { return Stroke(keycode: 49, shift: false, caps: false) }
+                return stroke(for: character, in: layout) ?? Stroke(keycode: 49, shift: false, caps: false)
             }
         }
         guard let strokes = prepared else {
@@ -223,6 +230,7 @@ final class SmokeTest {
         usleep(300000)
 
         for s in strokes {
+            if s.keycode == 999 { usleep(800000); continue }
             postRaw(s.keycode, flags: s.shift ? [.maskShift] : [])
             usleep(25000)
         }

@@ -166,6 +166,8 @@ struct PendingUndo {
 }
 
 let undoWindow = 2.0          // сколько секунд Backspace считается откатом
+let typingGuard = 1.5         // столько секунд после нажатия раскладку не трогаем
+let autoSwitchCooldown = 3.0  // и не переключаем автоматически чаще, чем раз в столько
 
 // MARK: - Свечение
 
@@ -230,6 +232,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var clipboardBackup: String?
     var inputTick = 0            // растёт на каждом настоящем нажатии
     var slowTick = 0
+    var lastInputAt: TimeInterval = 0
+    var lastAutoSwitchAt: TimeInterval = 0
     var lastStatusText = ""
     var corrections: [String] = []
     var pausedForSmoke = false
@@ -684,8 +688,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return enabledLayouts().first { sourceLang($0).lowercased().hasPrefix(wanted) }
     }
 
+    // Автоматическое переключение не должно влезать в набор: раньше
+    // смена роли поля посреди слова уводила раскладку, и «хочу»
+    // превращалось в «[очу»
     func select(_ source: TISInputSource, why: String) {
         guard sourceID(source) != currentLayoutFullID() else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - lastInputAt < typingGuard || !wordBuffer.isEmpty {
+            log("\(why): отложено, идёт набор")
+            rememberFieldLayout()   // подстраиваемся под то, что человек печатает сейчас
+            return
+        }
+        guard now - lastAutoSwitchAt > autoSwitchCooldown else {
+            log("\(why): пропущено, только что переключали")
+            return
+        }
+        lastAutoSwitchAt = now
         restoringLayout = true
         TISSelectInputSource(source)
         log(why)
@@ -704,7 +722,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         guard let role = attribute(kAXRoleAttribute as String) else { return nil }
         let subrole = attribute(kAXSubroleAttribute as String) ?? ""
-        return "\(bid):\(role)\(subrole.isEmpty ? "" : ":" + subrole)"
+        // AXTextField и AXTextArea в Electron подменяют друг друга у одного
+        // и того же поля, поэтому считаем их одной ролью
+        let normalized = (role == "AXTextArea" || role == "AXTextField") ? "AXText" : role
+        return "\(bid):\(normalized)\(subrole.isEmpty ? "" : ":" + subrole)"
     }
 
     func checkFocusedField() {
@@ -1108,7 +1129,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         let keycode = event.getIntegerValueField(.keyboardEventKeycode)
-        if type == .keyDown { inputTick &+= 1 }
+        if type == .keyDown {
+            inputTick &+= 1
+            lastInputAt = ProcessInfo.processInfo.systemUptime
+        }
         let caps = event.flags.contains(.maskAlphaShift)
         if caps != capsOn {
             capsOn = caps
