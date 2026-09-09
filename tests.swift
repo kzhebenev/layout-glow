@@ -96,7 +96,11 @@ check(parseHotkey("cmd+щщщ") == nil, "сочетание: неизвестн�
 let rules = SnippetFile.parse(defaultLayoutRules.joined(separator: "\n"))
 check(rules["com.apple.terminal"] == "en", "правила: терминал на английском")
 let hotkeys = SnippetFile.parse(defaultHotkeys.joined(separator: "\n"))
-check(hotkeys.count == 12, "сочетания: 12 действий по умолчанию")
+let expectedActions = Set(["строка", "абзац", "ключ", "буфер"]
+    + (1...9).map { "слот-\($0)" } + (1...10).map { "пресет-\($0)" })
+check(Set(hotkeys.keys) == expectedActions, "сочетания: все действия описаны по умолчанию")
+check(Set(SnippetFile.parse(defaultPresets.joined(separator: "\n")).keys).contains("1"),
+      "пресеты: первый задан по умолчанию")
 check(hotkeys.allSatisfy { parseHotkey($0.value) != nil }, "сочетания: все значения разбираются")
 
 // Адреса и номера версий, набранные не в той раскладке

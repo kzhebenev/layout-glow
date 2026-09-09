@@ -11,7 +11,7 @@ rm -rf "$BUILD" "$DMG"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 echo "Компилирую..."
-swiftc -O -framework Cocoa -framework Carbon "$DIR/Core.swift" "$DIR/Smoke.swift" "$DIR/Preferences.swift" "$DIR/main.swift" -o "$APP/Contents/MacOS/LayoutGlow"
+swiftc -O -framework Cocoa -framework Carbon "$DIR/Core.swift" "$DIR/Smoke.swift" "$DIR/Clipboard.swift" "$DIR/Preferences.swift" "$DIR/main.swift" -o "$APP/Contents/MacOS/LayoutGlow"
 
 cat > "$APP/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -23,8 +23,8 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
     <key>CFBundleExecutable</key><string>LayoutGlow</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>4.6</string>
-    <key>CFBundleVersion</key><string>25</string>
+    <key>CFBundleShortVersionString</key><string>4.7</string>
+    <key>CFBundleVersion</key><string>26</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>LSUIElement</key><true/>
     <key>NSHighResolutionCapable</key><true/>

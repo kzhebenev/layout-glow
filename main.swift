@@ -63,6 +63,7 @@ final class Settings {
             "perFieldLayout": false,
             "backspaceUndo": false,
             "dryRun": false,
+            "clipboardHistory": true,
             "allowedApps": ["com.termius.mac"],
             "fieldLayouts": [String: String](),
         ])
@@ -107,6 +108,10 @@ final class Settings {
     var onboarded: Bool {
         get { d.bool(forKey: "onboarded") }
         set { d.set(newValue, forKey: "onboarded") }
+    }
+    var clipboardHistory: Bool {
+        get { d.bool(forKey: "clipboardHistory") }
+        set { d.set(newValue, forKey: "clipboardHistory") }
     }
     var dryRun: Bool {
         get { d.bool(forKey: "dryRun") }
@@ -217,6 +222,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                 directory: dictionaryDirectory(iCloud: Settings.shared.iCloudSync))
     var hotkeysFile = SnippetFile(name: "hotkeys.txt", header: "", defaults: defaultHotkeys,
                                   directory: dictionaryDirectory(iCloud: Settings.shared.iCloudSync))
+    var presetsFile = SnippetFile(name: "presets.txt", header: "", defaults: defaultPresets,
+                                  directory: dictionaryDirectory(iCloud: Settings.shared.iCloudSync))
+    var clipboard: ClipboardHistory?
     var lastFieldKey = ""
     var secureFieldCached = false
     var clipboardBackup: String?
@@ -264,6 +272,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             name: NSNotification.Name("ru.devkz.layoutglow.setup"),
             object: nil, suspensionBehavior: .deliverImmediately)
         DistributedNotificationCenter.default().addObserver(
+            self, selector: #selector(snapshotWindows),
+            name: NSNotification.Name("ru.devkz.layoutglow.snapshot"),
+            object: nil, suspensionBehavior: .deliverImmediately)
+        DistributedNotificationCenter.default().addObserver(
             self, selector: #selector(showPreferences),
             name: NSNotification.Name("ru.devkz.layoutglow.prefs"),
             object: nil, suspensionBehavior: .deliverImmediately)
@@ -300,6 +312,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.commandsFile.reload()
             self.snippetsFile.reload()
             self.rulesFile.reload()
+            self.presetsFile.reload()
             if self.hotkeysFile.reloadIfChanged() { self.registerSlotHotkeys() }
             // Запасная проверка на случай, если уведомление о фокусе не пришло
             self.slowTick &+= 1
@@ -310,6 +323,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         loadCorrections()
+        clipboard = ClipboardHistory(delegate: self)
+        Timer.scheduledTimer(withTimeInterval: 0.8, repeats: true) { [weak self] _ in self?.clipboard?.check() }
+        ensureDefaultHotkeys()
         startTap()
         registerSlotHotkeys()
         AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.4)
@@ -904,6 +920,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.setSubmenu(sub, for: head)
         }
 
+        if let history = clipboard, !history.items.isEmpty {
+            let head = action("Буфер обмена (\(history.items.count))", #selector(doNothing), icon: "doc.on.clipboard")
+            let sub = NSMenu()
+            for (index, entry) in history.items.prefix(12).enumerated() {
+                let line = entry.replacingOccurrences(of: "\n", with: " ")
+                let short = line.count > 48 ? String(line.prefix(48)) + "…" : line
+                let item = NSMenuItem(title: short, action: #selector(pasteHistoryItem(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = index
+                sub.addItem(item)
+            }
+            sub.addItem(.separator())
+            let all = NSMenuItem(title: "Показать всё…", action: #selector(showClipboardPanel), keyEquivalent: "")
+            all.target = self
+            sub.addItem(all)
+            menu.setSubmenu(sub, for: head)
+        }
+        let presets = (1...10).compactMap { n -> (Int, String)? in
+            presetsFile.value(for: String(n)).map { (n, $0) }
+        }
+        if !presets.isEmpty {
+            let head = action("Пресеты (\(presets.count))", #selector(doNothing), icon: "text.badge.plus")
+            let sub = NSMenu()
+            for (number, value) in presets {
+                let short = value.count > 44 ? String(value.prefix(44)) + "…" : value
+                let item = NSMenuItem(title: "\(number) — \(short)", action: #selector(insertPresetItem(_:)),
+                                      keyEquivalent: "")
+                item.target = self
+                item.representedObject = number
+                item.toolTip = hotkeysFile.value(for: "пресет-\(number)") ?? ""
+                sub.addItem(item)
+            }
+            menu.setSubmenu(sub, for: head)
+        }
+
         menu.addItem(.separator())
         let preferencesItem = NSMenuItem(title: "Настройки…", action: #selector(showPreferences), keyEquivalent: ",")
         preferencesItem.target = self
@@ -934,6 +985,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func doNothing() {}
+
+    @objc func pasteHistoryItem(_ sender: NSMenuItem) {
+        guard let index = sender.representedObject as? Int else { return }
+        clipboard?.paste(index)
+    }
+
+    @objc func showClipboardPanel() { clipboard?.togglePanel() }
+
+    @objc func insertPresetItem(_ sender: NSMenuItem) {
+        guard let number = sender.representedObject as? Int else { return }
+        insertPreset(number)
+    }
 
     @objc func toggleFn() { Settings.shared.fnSwitch.toggle() }
     @objc func toggleAuto() { Settings.shared.autoCorrect.toggle() }
@@ -1328,6 +1391,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         replaceWithText(backspaces: count, text: text)
     }
 
+    func insertPreset(_ number: Int) {
+        guard let text = presetsFile.value(for: String(number)) else {
+            log("пресет \(number): пусто")
+            showPill(text: "пресет \(number) пуст", color: .systemGray)
+            return
+        }
+        log("вставка пресета \(number)")
+        replaceWithText(backspaces: 0, text: text)
+    }
+
     func insertSlot(_ number: Int) {
         guard let text = snippetsFile.value(for: String(number)) else {
             log("слот \(number): пусто")
@@ -1527,7 +1600,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let from = dictionaryDirectory(iCloud: Settings.shared.iCloudSync)
         let to = dictionaryDirectory(iCloud: wanted)
-        for name in ["exceptions.txt", "commands.txt", "snippets.txt", "layout-rules.txt", "hotkeys.txt"] {
+        for name in ["exceptions.txt", "commands.txt", "snippets.txt", "layout-rules.txt",
+                     "hotkeys.txt", "presets.txt"] {
             let src = from.appendingPathComponent(name)
             let dst = to.appendingPathComponent(name)
             guard FileManager.default.fileExists(atPath: src.path) else { continue }
@@ -1545,6 +1619,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         snippetsFile = SnippetFile(name: "snippets.txt", header: "", defaults: defaultSnippets, directory: to)
         rulesFile = SnippetFile(name: "layout-rules.txt", header: "", defaults: defaultLayoutRules, directory: to)
         hotkeysFile = SnippetFile(name: "hotkeys.txt", header: "", defaults: defaultHotkeys, directory: to)
+        presetsFile = SnippetFile(name: "presets.txt", header: "", defaults: defaultPresets, directory: to)
         registerSlotHotkeys()
         log("словари: \(wanted ? "в iCloud" : "локально") (\(to.path))")
         showPill(text: wanted ? "iCloud" : "локально", color: .systemGray)
@@ -1977,6 +2052,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Горячие клавиши слотов (Cmd+Option+1...9)
 
+    // Файл сочетаний мог быть создан прежней версией: дописываем
+    // действия, которых в нём ещё нет, не трогая уже настроенные
+    func ensureDefaultHotkeys() {
+        let defaults = SnippetFile.parse(defaultHotkeys.joined(separator: "\n"))
+        let missing = defaults.filter { hotkeysFile.value(for: $0.key) == nil }
+        guard !missing.isEmpty else { return }
+        var pairs = hotkeysFile.items.map { ($0.key, $0.value) }
+        pairs.append(contentsOf: missing.map { ($0.key, $0.value) })
+        hotkeysFile.replaceAll(pairs.sorted { $0.0 < $1.0 })
+        log("в сочетания добавлены новые действия: \(missing.keys.sorted().joined(separator: ", "))")
+    }
+
     func registerSlotHotkeys() {
         for ref in hotKeyRefs { if let ref { UnregisterEventHotKey(ref) } }
         hotKeyRefs.removeAll()
@@ -1995,6 +2082,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     case 100: me.convertLine()
                     case 101: me.convertParagraph()
                     case 102: me.expandSnippet()
+                    case 103: me.clipboard?.togglePanel()
+                    case 200...209: me.insertPreset(Int(hkID.id) - 199)
                     default: me.insertSlot(Int(hkID.id))
                     }
                 }
@@ -2003,8 +2092,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         // Действия и их номера; клавиши берём из hotkeys.txt
-        var actions: [(String, UInt32)] = [("строка", 100), ("абзац", 101), ("ключ", 102)]
+        var actions: [(String, UInt32)] = [("строка", 100), ("абзац", 101), ("ключ", 102), ("буфер", 103)]
         for n in 1...9 { actions.append(("слот-\(n)", UInt32(n))) }
+        for n in 1...10 { actions.append(("пресет-\(n)", UInt32(199 + n))) }
 
         var failed: [String] = []
         for (name, id) in actions {
@@ -2220,6 +2310,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func runSelfCheckNow() { runSelfCheck() }
+
+    // Отрисовка собственных окон в файл: позволяет посмотреть на интерфейс
+    // со стороны, когда снимок экрана недоступен
+    @objc func snapshotWindows() {
+        for window in NSApp.windows where window.isVisible {
+            guard let view = window.contentView,
+                  let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { continue }
+            view.cacheDisplay(in: view.bounds, to: rep)
+            guard let data = rep.representation(using: .png, properties: [:]) else { continue }
+            let name = window.title.isEmpty ? "окно" : window.title.replacingOccurrences(of: " ", with: "-")
+            try? data.write(to: supportDirectory().appendingPathComponent("snapshot-\(name).png"))
+        }
+        preferences?.snapshotAllTabs()
+        log("снимки окон сохранены")
+    }
 
     @objc func showPreferences() {
         if preferences == nil { preferences = PreferencesWindow(delegate: self) }

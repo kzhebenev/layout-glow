@@ -420,6 +420,11 @@ let defaultSnippets = [
     "1 = kz@devkz.ru",
 ]
 
+let defaultPresets = [
+    "# Пресеты вставки: «номер = текст», вставляются по Ctrl+Option+Cmd+цифра.",
+    "1 = kz@devkz.ru",
+]
+
 let exceptionsHeader = "# Слова, которые автоисправление не трогает. По строке на слово."
 let commandsHeader = "# Системные команды: считаются словами, чтобы «пкуз» превращалось в «grep»."
 
@@ -478,6 +483,17 @@ let defaultHotkeys = [
     "слот-7 = cmd+opt+7",
     "слот-8 = cmd+opt+8",
     "слот-9 = cmd+opt+9",
+    "буфер = ctrl+opt+cmd+v",
+    "пресет-1 = ctrl+opt+cmd+1",
+    "пресет-2 = ctrl+opt+cmd+2",
+    "пресет-3 = ctrl+opt+cmd+3",
+    "пресет-4 = ctrl+opt+cmd+4",
+    "пресет-5 = ctrl+opt+cmd+5",
+    "пресет-6 = ctrl+opt+cmd+6",
+    "пресет-7 = ctrl+opt+cmd+7",
+    "пресет-8 = ctrl+opt+cmd+8",
+    "пресет-9 = ctrl+opt+cmd+9",
+    "пресет-10 = ctrl+opt+cmd+0",
 ]
 
 let defaultLayoutRules = [

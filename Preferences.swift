@@ -11,13 +11,16 @@ final class PreferencesWindow: NSObject, NSTableViewDataSource, NSTableViewDeleg
     private var snippetsTable: NSTableView!
     private var exceptionsTable: NSTableView!
     private var hotkeysTable: NSTableView!
+    private var presetsTable: NSTableView!
 
     private var apps: [(bundleID: String, name: String, allowed: Bool, terminal: Bool)] = []
     private var snippets: [(String, String)] = []
     private var exceptions: [String] = []
     private var hotkeys: [(String, String)] = []
+    private var presets: [(String, String)] = []
 
-    private let actionNames = ["строка", "абзац", "ключ"] + (1...9).map { "слот-\($0)" }
+    private let actionNames = ["строка", "абзац", "ключ", "буфер"]
+        + (1...9).map { "слот-\($0)" } + (1...10).map { "пресет-\($0)" }
 
     init(delegate: AppDelegate) {
         self.delegate = delegate
@@ -34,8 +37,10 @@ final class PreferencesWindow: NSObject, NSTableViewDataSource, NSTableViewDeleg
     // MARK: Сборка окна
 
     private func build() {
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 720, height: 470),
-                          styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 520),
+                          styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                          backing: .buffered, defer: false)
+        window.minSize = NSSize(width: 700, height: 460)
         window.title = "Настройки LayoutGlow"
         window.isReleasedWhenClosed = false
         window.center()
@@ -45,6 +50,7 @@ final class PreferencesWindow: NSObject, NSTableViewDataSource, NSTableViewDeleg
         tabs.addTabViewItem(tab("Поведение", view: behaviourView()))
         tabs.addTabViewItem(tab("Приложения", view: appsView()))
         tabs.addTabViewItem(tab("Словари", view: dictionariesView()))
+        tabs.addTabViewItem(tab("Пресеты", view: presetsView()))
         tabs.addTabViewItem(tab("Сочетания", view: hotkeysView()))
         tabs.addTabViewItem(tab("Обслуживание", view: maintenanceView()))
         window.contentView = tabs
@@ -80,15 +86,19 @@ final class PreferencesWindow: NSObject, NSTableViewDataSource, NSTableViewDeleg
              { settings.capsGlow }, { settings.capsGlow = $0 }),
             ("Ярлык раскладки у курсора", "Появляется при переключении",
              { settings.caretDot }, { settings.caretDot = $0 }),
+            ("История буфера обмена", "Записи из менеджеров паролей не сохраняются",
+             { settings.clipboardHistory }, { settings.clipboardHistory = $0 }),
             ("Словари в iCloud", "Общий набор на всех маках",
              { settings.iCloudSync }, { _ in self.delegate.toggleICloud() }),
         ]
 
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 10
-        stack.edgeInsets = NSEdgeInsets(top: 18, left: 20, bottom: 18, right: 20)
+        let left = NSStackView()
+        let right = NSStackView()
+        for column in [left, right] {
+            column.orientation = .vertical
+            column.alignment = .leading
+            column.spacing = 12
+        }
 
         for (index, row) in rows.enumerated() {
             let box = NSButton(checkboxWithTitle: row.0, target: self, action: #selector(behaviourToggled(_:)))
@@ -103,9 +113,21 @@ final class PreferencesWindow: NSObject, NSTableViewDataSource, NSTableViewDeleg
             group.alignment = .leading
             group.spacing = 1
             group.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
-            stack.addArrangedSubview(group)
+            (index < (rows.count + 1) / 2 ? left : right).addArrangedSubview(group)
         }
-        return wrap(stack)
+        // Без распорки внизу галочки растягиваются по всей высоте
+        for column in [left, right] {
+            let spacer = NSView()
+            spacer.setContentHuggingPriority(.defaultLow, for: .vertical)
+            column.addArrangedSubview(spacer)
+        }
+        let columns = NSStackView(views: [left, right])
+        columns.orientation = .horizontal
+        columns.alignment = .top
+        columns.distribution = .fillEqually
+        columns.spacing = 24
+        columns.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+        return wrap(columns)
     }
 
     private var behaviourSetters: [(Bool) -> Void] = []
@@ -217,6 +239,41 @@ final class PreferencesWindow: NSObject, NSTableViewDataSource, NSTableViewDeleg
         NSWorkspace.shared.open(delegate.snippetsFile.url.deletingLastPathComponent())
     }
 
+    // MARK: Пресеты
+
+    private func presetsView() -> NSView {
+        presetsTable = table(columns: [("number", "Номер", 80), ("text", "Текст", 380),
+                                       ("combo", "Сочетание", 160)])
+        let edit = NSButton(title: "Изменить", target: self, action: #selector(editPreset))
+        let clear = NSButton(title: "Очистить", target: self, action: #selector(clearPreset))
+        return listLayout(table: presetsTable, buttons: [edit, clear],
+                          hint: "Десять пресетов на Ctrl+Option+Cmd+цифра; сочетания меняются на вкладке «Сочетания».")
+    }
+
+    @objc private func editPreset() {
+        let row = presetsTable.selectedRow
+        guard row >= 0, row < presets.count else { return }
+        let current = presets[row]
+        guard let value = ask("Пресет \(current.0)", "Что вставлять:", initial: current.1), !value.isEmpty else { return }
+        var pairs = presets.map { ($0.0, $0.1) }.filter { !$0.1.isEmpty }
+        if let index = pairs.firstIndex(where: { $0.0 == current.0 }) {
+            pairs[index] = (current.0, value)
+        } else {
+            pairs.append((current.0, value))
+        }
+        delegate.presetsFile.replaceAll(pairs.sorted { (Int($0.0) ?? 0) < (Int($1.0) ?? 0) })
+        reloadEverything()
+    }
+
+    @objc private func clearPreset() {
+        let row = presetsTable.selectedRow
+        guard row >= 0, row < presets.count else { return }
+        let pairs = presets.map { ($0.0, $0.1) }
+            .filter { $0.0 != presets[row].0 && !$0.1.isEmpty }
+        delegate.presetsFile.replaceAll(pairs)
+        reloadEverything()
+    }
+
     // MARK: Сочетания
 
     private func hotkeysView() -> NSView {
@@ -278,6 +335,7 @@ final class PreferencesWindow: NSObject, NSTableViewDataSource, NSTableViewDeleg
             button("Вернуться на предыдущую версию…", #selector(rollback)),
             button("Проверить себя сейчас", #selector(selfCheck)),
             button("История исправлений", #selector(openCorrections)),
+            button("Очистить историю буфера обмена", #selector(clearClipboard)),
             button("Журнал состояния", #selector(openStatus)),
             button("Разрешения системы", #selector(openPermissions)),
         ])
@@ -294,10 +352,35 @@ final class PreferencesWindow: NSObject, NSTableViewDataSource, NSTableViewDeleg
     @objc private func rollback() { delegate.rollbackToPrevious() }
     @objc private func selfCheck() { delegate.runSelfCheckNow() }
     @objc private func openCorrections() { delegate.openCorrections() }
+    @objc private func clearClipboard() {
+        delegate.clipboard?.clear()
+        let done = NSAlert()
+        done.messageText = "История буфера обмена очищена"
+        done.runModal()
+    }
     @objc private func openStatus() {
         NSWorkspace.shared.open(supportDirectory().appendingPathComponent("status.log"))
     }
     @objc private func openPermissions() { delegate.showOnboardingFromMenu() }
+
+    // Снимок каждой вкладки: смотреть на интерфейс со стороны полезнее,
+    // чем верить, что раскладка сложилась правильно
+    func snapshotAllTabs() {
+        guard let tabs = window?.contentView as? NSTabView else { return }
+        let selected = tabs.selectedTabViewItem
+        for (index, item) in tabs.tabViewItems.enumerated() {
+            tabs.selectTabViewItem(item)
+            window.layoutIfNeeded()
+            window.displayIfNeeded()
+            guard let view = window.contentView,
+                  let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { continue }
+            view.cacheDisplay(in: view.bounds, to: rep)
+            guard let data = rep.representation(using: .png, properties: [:]) else { continue }
+            let name = "tab-\(index)-\(item.label)".replacingOccurrences(of: " ", with: "-")
+            try? data.write(to: supportDirectory().appendingPathComponent("snapshot-\(name).png"))
+        }
+        if let selected { tabs.selectTabViewItem(selected) }
+    }
 
     // MARK: Общее
 
@@ -320,8 +403,12 @@ final class PreferencesWindow: NSObject, NSTableViewDataSource, NSTableViewDeleg
         snippets = delegate.snippetsFile.items.sorted { $0.key < $1.key }.map { ($0.key, $0.value) }
         exceptions = delegate.exceptionsFile.words.sorted()
         hotkeys = actionNames.map { ($0, delegate.hotkeysFile.value(for: $0) ?? "не задано") }
+        presets = (1...10).map { number in
+            (String(number), delegate.presetsFile.value(for: String(number)) ?? "")
+        }
 
         appsTable?.reloadData()
+        presetsTable?.reloadData()
         snippetsTable?.reloadData()
         exceptionsTable?.reloadData()
         hotkeysTable?.reloadData()
@@ -357,44 +444,65 @@ final class PreferencesWindow: NSObject, NSTableViewDataSource, NSTableViewDeleg
         view.dataSource = self
         view.delegate = self
         view.usesAlternatingRowBackgroundColors = true
-        view.rowHeight = 20
+        view.rowHeight = 22
+        view.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
+        view.style = .inset
         return view
     }
 
+    // Таблица занимает всё свободное место, кнопки и подпись прижаты книзу.
+    // Стеком это не получалось: таблица без своей высоты схлопывалась
     private func listLayout(table: NSTableView, buttons: [NSButton], hint: String) -> NSView {
+        let container = NSView()
+
         let scroll = NSScrollView()
         scroll.documentView = table
         scroll.hasVerticalScroller = true
         scroll.borderType = .bezelBorder
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(scroll)
 
+        buttons.forEach { $0.bezelStyle = .rounded }
         let row = NSStackView(views: buttons)
         row.orientation = .horizontal
         row.spacing = 8
-        buttons.forEach { $0.bezelStyle = .rounded }
+        row.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(row)
 
         let note = NSTextField(labelWithString: hint)
         note.font = .systemFont(ofSize: 11)
         note.textColor = .secondaryLabelColor
+        note.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(note)
 
-        let stack = NSStackView(views: [scroll, row, note])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 8
-        stack.edgeInsets = NSEdgeInsets(top: 14, left: 16, bottom: 14, right: 16)
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
-        scroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 320).isActive = true
-        return stack
+        NSLayoutConstraint.activate([
+            scroll.topAnchor.constraint(equalTo: container.topAnchor, constant: 16),
+            scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 18),
+            scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -18),
+            scroll.bottomAnchor.constraint(equalTo: row.topAnchor, constant: -12),
+
+            row.leadingAnchor.constraint(equalTo: scroll.leadingAnchor),
+            row.trailingAnchor.constraint(lessThanOrEqualTo: scroll.trailingAnchor),
+            row.bottomAnchor.constraint(equalTo: note.topAnchor, constant: -8),
+
+            note.leadingAnchor.constraint(equalTo: scroll.leadingAnchor),
+            note.trailingAnchor.constraint(lessThanOrEqualTo: scroll.trailingAnchor),
+            note.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -16),
+        ])
+        return container
     }
 
+    // Содержимое вкладки должно занимать её целиком, иначе таблицы
+    // жмутся в угол и колонки обрезаются
     private func wrap(_ view: NSView) -> NSView {
         let container = NSView()
         view.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(view)
         NSLayoutConstraint.activate([
             view.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            view.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor),
+            view.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             view.topAnchor.constraint(equalTo: container.topAnchor),
+            view.bottomAnchor.constraint(equalTo: container.bottomAnchor),
         ])
         return container
     }
@@ -407,6 +515,7 @@ final class PreferencesWindow: NSObject, NSTableViewDataSource, NSTableViewDeleg
         case snippetsTable: return snippets.count
         case exceptionsTable: return exceptions.count
         case hotkeysTable: return hotkeys.count
+        case presetsTable: return presets.count
         default: return 0
         }
     }
@@ -427,6 +536,13 @@ final class PreferencesWindow: NSObject, NSTableViewDataSource, NSTableViewDeleg
             return exceptions[row]
         case hotkeysTable:
             return id == "action" ? hotkeys[row].0 : hotkeys[row].1
+        case presetsTable:
+            let preset = presets[row]
+            switch id {
+            case "number": return preset.0
+            case "text": return preset.1.isEmpty ? "—" : preset.1
+            default: return delegate.hotkeysFile.value(for: "пресет-\(preset.0)") ?? ""
+            }
         default: return nil
         }
     }
