@@ -179,6 +179,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var hotkeysFile = SnippetFile(name: "hotkeys.txt", header: "", defaults: defaultHotkeys,
                                   directory: dictionaryDirectory(iCloud: Settings.shared.iCloudSync))
     var lastFieldKey = ""
+    var secureFieldCached = false
+    var clipboardBackup: String?
     var onboardingWindow: NSWindow?
     var shortcutsWindow: NSWindow?
     var onboardingTimer: Timer?
@@ -246,6 +248,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.rulesFile.reload()
             if self.hotkeysFile.reloadIfChanged() { self.registerSlotHotkeys() }
             if Settings.shared.perFieldLayout { self.checkFocusedField() }
+            self.secureFieldCached = self.isSecureFieldFocused()
         }
 
         startTap()
@@ -383,6 +386,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // MARK: Точка у курсора
+
+    // Поле для пароля: правка текста в нём недопустима — под звёздочками
+    // не видно, что произошло, и пароль молча портится. Нативные поля даёт
+    // secure input, веб-поля определяются по подроли и подсказкам
+    func isSecureFieldFocused() -> Bool {
+        if IsSecureEventInputEnabled() { return true }
+        guard let element = focusedElement() else { return false }
+        func attribute(_ name: String) -> String? {
+            var ref: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(element, name as CFString, &ref) == .success else { return nil }
+            return ref as? String
+        }
+        if attribute(kAXSubroleAttribute as String) == "AXSecureTextField" { return true }
+        let hints = [kAXRoleDescriptionAttribute as String, kAXPlaceholderValueAttribute as String,
+                     kAXTitleAttribute as String, kAXDescriptionAttribute as String]
+        for name in hints {
+            guard let value = attribute(name)?.lowercased() else { continue }
+            if value.contains("secure") || value.contains("password") || value.contains("пароль") { return true }
+        }
+        return false
+    }
 
     func focusedElement() -> AXUIElement? {
         guard AXIsProcessTrusted() else { return nil }
@@ -961,7 +985,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func trackKey(event: CGEvent, keycode: Int64) {
         guard Settings.shared.autoCorrect || Settings.shared.manualConvert else { return }
-        if IsSecureEventInputEnabled() { wordBuffer.removeAll(); lastWord = nil; return }
+        if IsSecureEventInputEnabled() || secureFieldCached { wordBuffer.removeAll(); lastWord = nil; return }
         let flags = event.flags
         if flags.contains(.maskCommand) || flags.contains(.maskControl) || flags.contains(.maskAlternate) {
             // Своё сочетание Cmd+Option+цифра буфер не сбрасывает:
@@ -1020,6 +1044,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func autoCorrect(_ word: [Stroke], boundary: Stroke? = nil) {
         guard !word.isEmpty, let cur = currentSource(), let other = otherLayout() else { return }
         if Settings.shared.isExcluded(frontApp?.bundleIdentifier) { return }
+        if isSecureFieldFocused() {
+            log("пропуск: поле для пароля")
+            wordBuffer.removeAll(); lastWord = nil
+            return
+        }
+
+        let full = translate(word, via: cur)
+        if looksTechnical(full) {
+            log("пропуск «\(full)»: ссылка, почта или путь")
+            return
+        }
 
         // Два прочтения: «всё это слово» и «в конце знаки препинания».
         // Первое важно потому, что «;» и «,» в русской раскладке — буквы «ж» и «б»
@@ -1044,29 +1079,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 continue
             }
 
-            let tail = Array(word.dropFirst(letters.count))
+            // Хвост знаков и сам знак-граница остаются как набраны:
+            // вставляем текст целиком, поэтому переводить их в клавиши не нужно
+            let tail = translate(Array(word.dropFirst(letters.count)), via: cur)
+            let boundaryText = boundary.map { translate([$0], via: cur) } ?? " "
             log("исправлено «\(typed)» -> «\(converted)»")
             lastAutoTyped = typed
-
-            // После смены раскладки те же клавиши дадут другие символы,
-            // поэтому хвост и знак-границу набираем клавишами целевой раскладки
-            var trailing: [Stroke] = []
-            for ch in translate(tail, via: cur) {
-                if let s = stroke(for: ch, in: other) { trailing.append(s) }
-            }
-            if let boundary, let ch = translate([boundary], via: cur).first,
-               let s = stroke(for: ch, in: other) {
-                trailing.append(s)
-            } else if boundary == nil {
-                trailing.append(Stroke(keycode: 49, shift: false, caps: false))  // пробел
-            }
-
-            performReplace(strokes: letters, trailing: trailing, to: other)
             lastWord = word
-            lastWordTrailing = trailing.count
+            lastWordTrailing = boundaryText.count
+
+            replaceLast(word.count + boundaryText.count,
+                        with: converted + tail + boundaryText, switchTo: other)
             return
         }
-        log("пропуск «\(translate(word, via: cur))»: \(lastReason)")
+        log("пропуск «\(full)»: \(lastReason)")
     }
 
     // MARK: Ручная конвертация и вставки
@@ -1095,8 +1121,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         log("двойной Shift: «\(currentSource().map { translate(strokes, via: $0) } ?? "")» -> «\(translate(strokes, via: other))»")
-        let trailingStrokes = Array(repeating: Stroke(keycode: 49, shift: false, caps: false), count: trailing)
-        performReplace(strokes: strokes, trailing: trailingStrokes, to: other)
+        let text = translate(strokes, via: other) + String(repeating: " ", count: trailing)
+        replaceLast(strokes.count + trailing, with: text, switchTo: other)
         wordBuffer.removeAll()
         lastWord = strokes
         lastWordTrailing = trailing
@@ -1135,33 +1161,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         replaceWithText(backspaces: 0, text: text)
     }
 
-    // Конвертация выделенного текста через Универсальный доступ, запасной путь — буфер обмена
+    // Конвертация выделенного текста. Accessibility отдаёт выделение далеко
+    // не везде (браузеры и Electron — примерно в половине случаев), поэтому
+    // при отказе текст берётся через буфер обмена копированием
     func convertSelection() -> Bool {
-        guard AXIsProcessTrusted() else { return false }
-        let system = AXUIElementCreateSystemWide()
-        var focusedRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
-              let f = focusedRef, CFGetTypeID(f) == AXUIElementGetTypeID() else { return false }
-        let element = f as! AXUIElement
-
-        var selRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextAttribute as CFString, &selRef) == .success,
-              let selected = selRef as? String, !selected.isEmpty else { return false }
-
-        guard let (converted, target) = convertText(selected), converted != selected else { return false }
-
-        if AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, converted as CFTypeRef) == .success {
-            TISSelectInputSource(target)
+        if isSecureFieldFocused() {
+            log("выделение: поле для пароля, не трогаю")
+            return false
+        }
+        if let (element, selected) = selectionViaAccessibility() {
+            guard let (converted, target) = convertText(selected), converted != selected else { return false }
+            if AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString,
+                                            converted as CFTypeRef) == .success {
+                TISSelectInputSource(target)
+                log("выделение: заменено напрямую")
+                return true
+            }
+            replaceSelectionByPaste(converted, target: target)
             return true
         }
+        guard let selected = selectionViaClipboard() else { return false }
+        guard let (converted, target) = convertText(selected), converted != selected else { return false }
+        replaceSelectionByPaste(converted, target: target)
+        log("выделение: заменено через буфер обмена")
+        return true
+    }
 
+    func selectionViaAccessibility() -> (AXUIElement, String)? {
+        guard AXIsProcessTrusted(), let element = focusedElement() else { return nil }
+        var selRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextAttribute as CFString, &selRef) == .success,
+              let selected = selRef as? String, !selected.isEmpty else { return nil }
+        return (element, selected)
+    }
+
+    // Копируем выделение и ждём, пока изменится счётчик буфера обмена:
+    // если он не изменился, значит выделять было нечего
+    func selectionViaClipboard() -> String? {
+        guard ensureAccessibility() else { return nil }
         let pb = NSPasteboard.general
-        let saved = pb.string(forType: .string)
+        let before = pb.changeCount
+        clipboardBackup = pb.string(forType: .string)
+        postKey(8, flags: .maskCommand)  // Cmd+C
+        for _ in 0..<30 {
+            usleep(15000)
+            if pb.changeCount != before { return pb.string(forType: .string) }
+        }
+        return nil
+    }
+
+    func replaceSelectionByPaste(_ text: String, target: TISInputSource) {
+        let pb = NSPasteboard.general
+        let saved = clipboardBackup ?? pb.string(forType: .string)
+        clipboardBackup = nil
         pb.clearContents()
-        pb.setString(converted, forType: .string)
+        pb.setString(text, forType: .string)
         DispatchQueue.global(qos: .userInteractive).async {
+            usleep(30000)
             self.postKey(9, flags: .maskCommand)  // Cmd+V
-            usleep(150000)
+            usleep(260000)
             DispatchQueue.main.async {
                 TISSelectInputSource(target)
                 if let saved {
@@ -1170,7 +1228,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
         }
-        return true
     }
 
     func convertText(_ text: String) -> (String, TISInputSource)? {
@@ -1186,7 +1243,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let target = layouts.first(where: { sourceLang($0).hasPrefix(wantLang) }),
               let from = layouts.first(where: { sourceID($0) != sourceID(target) }) else { return nil }
         let map = charMap(from: from, to: target)
-        return (String(text.map { map[$0] ?? $0 }), target)
+        return (convertTextTokens(text, map: map), target)
     }
 
     // MARK: Конвертация текущей строки (Cmd+Option+минус)
@@ -1601,7 +1658,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             e.flags = flags
             e.setIntegerValueField(.eventSourceUserData, value: syntheticMagic)
             e.post(tap: .cgSessionEventTap)
-            usleep(1200)
+            usleep(2500)
         }
     }
 
@@ -1628,34 +1685,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return false
     }
 
-    func replaceWithText(backspaces: Int, text: String) {
-        guard !replaceInProgress, ensureAccessibility() else { return }
+    // Заменяет последние `count` символов текстом. Раньше здесь были backspace
+    // и посимвольная перепечатка — события уходили быстрее, чем приложение
+    // успевало их обработать, отсюда «ККОШКА» вместо «КОШКА». Выделение
+    // стрелками плюс одна вставка атомарны и от скорости не зависят.
+    func replaceLast(_ count: Int, with text: String, switchTo target: TISInputSource?) {
+        guard ensureAccessibility() else { return }
+        guard !replaceInProgress else {
+            log("замена: предыдущая ещё идёт, пропуск")
+            return
+        }
         replaceInProgress = true
+        // Страховка: если приложение не ответит, флаг не должен залипнуть навсегда
+        let watchdog = DispatchWorkItem { [weak self] in
+            guard let self, self.replaceInProgress else { return }
+            self.replaceInProgress = false
+            self.log("замена: сброс по таймауту")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: watchdog)
+
+        let pb = NSPasteboard.general
+        let saved = pb.string(forType: .string)
         DispatchQueue.global(qos: .userInteractive).async {
-            for _ in 0..<backspaces { self.postKey(51) }
-            if backspaces > 0 { usleep(20000) }
-            self.pasteText(text)
-            DispatchQueue.main.async { self.replaceInProgress = false }
+            if count > 0 {
+                for _ in 0..<count { self.postKey(123, flags: .maskShift) }  // Shift+Влево
+                usleep(70000)
+            }
+            DispatchQueue.main.sync {
+                pb.clearContents()
+                pb.setString(text, forType: .string)
+            }
+            usleep(30000)
+            self.postKey(9, flags: .maskCommand)  // Cmd+V
+            usleep(260000)
+            DispatchQueue.main.async {
+                watchdog.cancel()
+                if let target { TISSelectInputSource(target) }
+                if let saved {
+                    pb.clearContents()
+                    pb.setString(saved, forType: .string)
+                }
+                self.replaceInProgress = false
+            }
         }
     }
 
-    func performReplace(strokes: [Stroke], trailing: [Stroke], to target: TISInputSource) {
-        guard !replaceInProgress, ensureAccessibility() else { return }
-        replaceInProgress = true
-        let total = strokes.count + trailing.count
-        DispatchQueue.global(qos: .userInteractive).async {
-            for _ in 0..<total { self.postKey(51) }
-            usleep(20000)
-            DispatchQueue.main.sync { _ = TISSelectInputSource(target) }
-            usleep(50000)  // даём раскладке примениться
-            for s in strokes + trailing {
-                var flags: CGEventFlags = []
-                if s.shift { flags.insert(.maskShift) }
-                if s.caps { flags.insert(.maskAlphaShift) }
-                self.postKey(s.keycode, flags: flags)
-            }
-            DispatchQueue.main.async { self.replaceInProgress = false }
-        }
+    func replaceWithText(backspaces: Int, text: String) {
+        replaceLast(backspaces, with: text, switchTo: nil)
     }
 
     // MARK: Горячие клавиши слотов (Cmd+Option+1...9)

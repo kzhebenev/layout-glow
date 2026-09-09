@@ -11,9 +11,26 @@ KC_NAME="layoutglow.keychain"
 PASSFILE="$SUPPORT/signing.pass"
 CN="LayoutGlow Self-Signed"
 
+# Пароль мог остаться в основной связке, если файл потерялся
+if [ ! -f "$PASSFILE" ]; then
+    RECOVERED=$(security find-generic-password -s ru.devkz.layoutglow.signing -w 2>/dev/null || true)
+    if [ -n "$RECOVERED" ]; then
+        mkdir -p "$SUPPORT"
+        umask 077
+        printf '%s' "$RECOVERED" > "$PASSFILE"
+        echo "Пароль подписи восстановлен из связки ключей."
+    fi
+fi
+
 if security find-identity -v -p codesigning "$KEYCHAIN" 2>/dev/null | grep -q "$CN"; then
-    echo "Сертификат «$CN» уже есть."
-    exit 0
+    if [ -f "$PASSFILE" ] && security unlock-keychain -p "$(cat "$PASSFILE")" "$KEYCHAIN" 2>/dev/null; then
+        echo "Сертификат «$CN» уже есть."
+        exit 0
+    fi
+    echo "Связка есть, но пароль утерян — пересоздаю сертификат."
+    echo "После этого macOS попросит заново выдать разрешения приложению."
+    security delete-keychain "$KC_NAME" 2>/dev/null || security delete-keychain "$KEYCHAIN" 2>/dev/null || true
+    rm -f "$KEYCHAIN"
 fi
 
 mkdir -p "$SUPPORT"
@@ -22,6 +39,10 @@ if [ ! -f "$PASSFILE" ]; then
     LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32 > "$PASSFILE"
 fi
 PASS="$(cat "$PASSFILE")"
+
+# Дубликат пароля в основной связке: файл в Application Support может
+# исчезнуть при переносе проекта, и тогда сертификат становится мусором
+security add-generic-password -U -s ru.devkz.layoutglow.signing -a signing -w "$PASS" 2>/dev/null || true
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT

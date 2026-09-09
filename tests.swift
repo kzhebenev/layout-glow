@@ -99,6 +99,32 @@ let hotkeys = SnippetFile.parse(defaultHotkeys.joined(separator: "\n"))
 check(hotkeys.count == 12, "сочетания: 12 действий по умолчанию")
 check(hotkeys.allSatisfy { parseHotkey($0.value) != nil }, "сочетания: все значения разбираются")
 
+// Ссылки, почта и национальные домены
+check(looksTechnical("http://vk.com"), "ссылка со схемой")
+check(looksTechnical("www.google.com"), "ссылка с www")
+check(looksTechnical("kz@devkz.ru"), "адрес почты")
+check(looksTechnical("/usr/local/bin"), "путь")
+check(looksTechnical("localhost:8080/api"), "хост с портом")
+check(!looksTechnical("привет"), "обычное слово")
+check(!looksTechnical("дабл-шифт"), "слово с дефисом")
+check(isNationalDomain("ujceckeub.ha"), "домен .рф, набранный не в той раскладке")
+check(isNationalDomain("госуслуги.рф"), "домен .рф кириллицей")
+check(!isNationalDomain("vk.com"), "обычный домен")
+
+// Конвертация текста уважает ссылки и адреса
+if let ru = enabledLayouts().first(where: { sourceLang($0).hasPrefix("ru") }),
+   let en = enabledLayouts().first(where: { sourceLang($0).hasPrefix("en") }) {
+    let toRu = charMap(from: en, to: ru)
+    check(convertTextTokens("ghbdtn", map: toRu) == "привет", "текст: обычное слово конвертируется")
+    check(convertTextTokens("http://vk.com", map: toRu) == "http://vk.com", "текст: ссылка не тронута")
+    check(convertTextTokens("kz@devkz.ru", map: toRu) == "kz@devkz.ru", "текст: почта не тронута")
+    check(convertTextTokens("ghbdtn http://vk.com", map: toRu) == "привет http://vk.com",
+          "текст: слово рядом со ссылкой конвертируется")
+    let national = convertTextTokens("https://ujceckeub.ha", map: toRu)
+    check(national.hasPrefix("https://") && national.hasSuffix(".рф"),
+          "текст: домен .рф чинится, схема остаётся латиницей (получено «\(national)»)")
+}
+
 // Словарь вставок
 let parsed = SnippetFile.parse("""
 # комментарий

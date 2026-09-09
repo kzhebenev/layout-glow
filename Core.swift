@@ -445,3 +445,73 @@ let defaultLayoutRules = [
     "com.apple.dt.Xcode = en",
     "com.microsoft.VSCode = en",
 ]
+
+// MARK: - Ссылки, адреса и национальные домены
+
+// Похоже на ссылку, почту или путь: такое конвертировать нельзя
+func looksTechnical(_ token: String) -> Bool {
+    let t = token.lowercased()
+    if t.contains("://") || t.hasPrefix("www.") || t.contains("@") { return true }
+    if t.contains("/") || t.contains("\\") { return true }
+    if t.contains(":") && t.contains(".") { return true }
+    return false
+}
+
+// Домен, которому положено быть кириллицей: «.рф» либо он же, набранный
+// не в той раскладке, — клавиши «ha» дают «рф»
+func isNationalDomain(_ token: String) -> Bool {
+    let t = token.lowercased()
+    for suffix in [".рф", ".ha"] {
+        if t.hasSuffix(suffix) { return true }
+        if let range = t.range(of: suffix + "/") , !range.isEmpty { return true }
+        if t.contains(suffix + "/") { return true }
+    }
+    return false
+}
+
+// Хост внутри ссылки: между «://» и первым «/» после него
+func hostRange(in token: String) -> Range<String.Index>? {
+    var start = token.startIndex
+    if let scheme = token.range(of: "://") { start = scheme.upperBound }
+    let rest = token[start...]
+    let end = rest.firstIndex(of: "/") ?? token.endIndex
+    return start < end ? start..<end : nil
+}
+
+// Конвертация текста с оглядкой на ссылки: обычные слова меняем,
+// ссылки, почту и пути оставляем как есть, но кириллический домен
+// внутри ссылки всё-таки чиним
+func convertTextTokens(_ text: String, map: [Character: Character]) -> String {
+    func convert(_ s: Substring) -> String { String(s.map { map[$0] ?? $0 }) }
+
+    var result = ""
+    var token = ""
+    func flush() {
+        guard !token.isEmpty else { return }
+        if !looksTechnical(token) {
+            result += convert(Substring(token))
+        } else if isNationalDomain(token), let host = hostRange(in: token) {
+            // В хосте точки и дефисы — разделители, а не буквы:
+            // без этого «ujceckeub.ha» дало бы «госуслугиюрф»
+            let parts = token[host].split(separator: ".", omittingEmptySubsequences: false)
+            let converted = parts.map { part -> String in
+                part.split(separator: "-", omittingEmptySubsequences: false)
+                    .map { convert($0) }.joined(separator: "-")
+            }.joined(separator: ".")
+            result += token[token.startIndex..<host.lowerBound] + converted + token[host.upperBound...]
+        } else {
+            result += token
+        }
+        token = ""
+    }
+    for ch in text {
+        if ch.isWhitespace || ch.isNewline {
+            flush()
+            result.append(ch)
+        } else {
+            token.append(ch)
+        }
+    }
+    flush()
+    return result
+}
