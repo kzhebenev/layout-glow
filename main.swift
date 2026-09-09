@@ -61,6 +61,7 @@ final class Settings {
             "iCloudSync": false,
             "onboarded": false,
             "perFieldLayout": false,
+            "backspaceUndo": false,
             "fieldLayouts": [String: String](),
         ])
     }
@@ -105,6 +106,10 @@ final class Settings {
         get { d.bool(forKey: "onboarded") }
         set { d.set(newValue, forKey: "onboarded") }
     }
+    var backspaceUndo: Bool {
+        get { d.bool(forKey: "backspaceUndo") }
+        set { d.set(newValue, forKey: "backspaceUndo") }
+    }
     var perFieldLayout: Bool {
         get { d.bool(forKey: "perFieldLayout") }
         set { d.set(newValue, forKey: "perFieldLayout") }
@@ -124,6 +129,18 @@ final class Settings {
         excludedApps = s
     }
 }
+
+// Что вернуть, если сразу после автоисправления нажат Backspace
+struct PendingUndo {
+    let corrected: String     // что оказалось в тексте
+    let original: String      // что было набрано
+    let word: String          // слово для списка исключений
+    let layoutID: String      // раскладка, в которой набирали
+    let bundleID: String?
+    let at: TimeInterval
+}
+
+let undoWindow = 2.0          // сколько секунд Backspace считается откатом
 
 // MARK: - Свечение
 
@@ -166,6 +183,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     var hotKeyRefs: [EventHotKeyRef?] = []
     var manualAXEnabled = Set<pid_t>()
+    var axObserver: AXObserver?
+    var observedPid: pid_t = 0
     var hotkeyHandlerInstalled = false
 
     var exceptionsFile = WordFile(name: "exceptions.txt", header: exceptionsHeader,
@@ -181,6 +200,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var lastFieldKey = ""
     var secureFieldCached = false
     var clipboardBackup: String?
+    var inputTick = 0            // растёт на каждом настоящем нажатии
+    var slowTick = 0
+    var pendingUndo: PendingUndo?
     var onboardingWindow: NSWindow?
     var shortcutsWindow: NSWindow?
     var onboardingTimer: Timer?
@@ -232,6 +254,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if app.bundleIdentifier != Bundle.main.bundleIdentifier {
                 self.frontApp = app
                 self.enableManualAccessibility(for: app)
+                self.observeFocus(for: app)
+                self.focusChanged()
                 self.restoreLayout(for: app)
             }
             self.wordBuffer.removeAll()
@@ -247,8 +271,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.snippetsFile.reload()
             self.rulesFile.reload()
             if self.hotkeysFile.reloadIfChanged() { self.registerSlotHotkeys() }
-            if Settings.shared.perFieldLayout { self.checkFocusedField() }
-            self.secureFieldCached = self.isSecureFieldFocused()
+            // Запасная проверка на случай, если уведомление о фокусе не пришло
+            self.slowTick &+= 1
+            if self.slowTick % 6 == 0 {
+                if Settings.shared.perFieldLayout { self.checkFocusedField() }
+                self.secureFieldCached = self.isSecureFieldFocused()
+            }
         }
 
         startTap()
@@ -527,6 +555,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // Electron (Claude, Termius, VS Code) держит дерево доступности выключенным,
     // пока его об этом не попросят
+    // Подписка на смену фокуса: опрос раз в полсекунды и запаздывал,
+    // и зря будил систему. Уведомление приходит сразу
+    func observeFocus(for app: NSRunningApplication) {
+        let pid = app.processIdentifier
+        guard pid > 0, pid != observedPid else { return }
+        if let old = axObserver {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(old), .defaultMode)
+        }
+        axObserver = nil
+        observedPid = 0
+
+        var observer: AXObserver?
+        let callback: AXObserverCallback = { _, _, _, refcon in
+            guard let refcon else { return }
+            let me = Unmanaged<AppDelegate>.fromOpaque(refcon).takeUnretainedValue()
+            DispatchQueue.main.async { me.focusChanged() }
+        }
+        guard AXObserverCreate(pid, callback, &observer) == .success, let observer else { return }
+        let element = AXUIElementCreateApplication(pid)
+        let status = AXObserverAddNotification(observer, element,
+                                               kAXFocusedUIElementChangedNotification as CFString,
+                                               Unmanaged.passUnretained(self).toOpaque())
+        guard status == .success else { return }
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
+        axObserver = observer
+        observedPid = pid
+    }
+
+    @objc func focusChanged() {
+        secureFieldCached = isSecureFieldFocused()
+        wordBuffer.removeAll()
+        lastWord = nil
+        pendingUndo = nil
+        if Settings.shared.perFieldLayout { checkFocusedField() }
+    }
+
     func enableManualAccessibility(for app: NSRunningApplication) {
         let pid = app.processIdentifier
         guard pid > 0, !manualAXEnabled.contains(pid) else { return }
@@ -729,6 +793,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         header("Исправление")
         toggle("Автоисправление раскладки", s.autoCorrect, #selector(toggleAuto), icon: "wand.and.stars")
         toggle("Конвертация по двойному Shift", s.manualConvert, #selector(toggleManual), icon: "arrow.2.squarepath")
+        toggle("Откат исправления по Backspace", s.backspaceUndo, #selector(toggleBackspaceUndo), icon: "delete.left")
         if let app = frontApp, let bid = app.bundleIdentifier {
             let name = app.localizedName ?? appName(for: bid)
             toggle("Исправлять в «\(name)»", !s.isExcluded(bid), #selector(toggleFrontApp), icon: "app.badge.checkmark")
@@ -812,6 +877,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleFn() { Settings.shared.fnSwitch.toggle() }
     @objc func toggleAuto() { Settings.shared.autoCorrect.toggle() }
     @objc func toggleManual() { Settings.shared.manualConvert.toggle() }
+    @objc func toggleBackspaceUndo() { Settings.shared.backspaceUndo.toggle() }
     @objc func togglePerApp() {
         Settings.shared.perAppLayout.toggle()
         if Settings.shared.perAppLayout { rememberLayout() }
@@ -906,6 +972,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         let keycode = event.getIntegerValueField(.keyboardEventKeycode)
+        if type == .keyDown { inputTick &+= 1 }
         let caps = event.flags.contains(.maskAlphaShift)
         if caps != capsOn {
             capsOn = caps
@@ -997,6 +1064,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         switch keycode {
         case 49:  // пробел — граница слова
+            pendingUndo = nil
             let word = wordBuffer
             wordBuffer.removeAll()
             if !word.isEmpty {
@@ -1007,6 +1075,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 lastWordTrailing = min(lastWordTrailing + 1, 4)
             }
         case 51:  // backspace
+            // Сразу после автоисправления Backspace означает «верни как было»
+            if Settings.shared.backspaceUndo, let undo = pendingUndo, undoIsFresh(undo) {
+                pendingUndo = nil
+                undoAutoCorrection(undo)
+                return
+            }
+            pendingUndo = nil
             if wordBuffer.isEmpty { lastWord = nil } else { wordBuffer.removeLast() }
         case 36, 76, 48, 53, 117, 115, 116, 119, 121, 123, 124, 125, 126:
             wordBuffer.removeAll(); lastWord = nil
@@ -1088,11 +1163,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             lastWord = word
             lastWordTrailing = boundaryText.count
 
-            replaceLast(word.count + boundaryText.count,
-                        with: converted + tail + boundaryText, switchTo: other)
+            let replacement = converted + tail + boundaryText
+            pendingUndo = PendingUndo(corrected: replacement, original: full + boundaryText,
+                                      word: typed, layoutID: currentLayoutFullID(),
+                                      bundleID: frontApp?.bundleIdentifier,
+                                      at: ProcessInfo.processInfo.systemUptime)
+            replaceLast(word.count + boundaryText.count, with: replacement,
+                        switchTo: other, guardTick: inputTick)
             return
         }
         log("пропуск «\(full)»: \(lastReason)")
+    }
+
+    func undoIsFresh(_ undo: PendingUndo) -> Bool {
+        ProcessInfo.processInfo.systemUptime - undo.at < undoWindow
+            && undo.bundleID == frontApp?.bundleIdentifier
+    }
+
+    // Backspace уже съел один символ, поэтому возвращаем остаток.
+    // В список исключений слово при этом НЕ попадает: обычное нажатие
+    // Backspace слишком легко спутать с намерением «никогда не исправляй»
+    func undoAutoCorrection(_ undo: PendingUndo) {
+        wordBuffer.removeAll()
+        lastWord = nil
+        lastAutoTyped = nil
+        let remaining = max(0, undo.corrected.count - 1)
+        let target = layout(withID: undo.layoutID)
+        let tick = inputTick
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.09) {
+            self.replaceLast(remaining, with: undo.original, switchTo: target, guardTick: tick)
+            self.log("откат по Backspace: «\(undo.word)» возвращено и добавлено в исключения")
+            self.showPill(text: "откат", color: .systemGray)
+        }
     }
 
     // MARK: Ручная конвертация и вставки
@@ -1214,18 +1316,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let pb = NSPasteboard.general
         let saved = clipboardBackup ?? pb.string(forType: .string)
         clipboardBackup = nil
-        pb.clearContents()
-        pb.setString(text, forType: .string)
+        writeClipboard(text)
         DispatchQueue.global(qos: .userInteractive).async {
             usleep(30000)
             self.postKey(9, flags: .maskCommand)  // Cmd+V
             usleep(260000)
             DispatchQueue.main.async {
                 TISSelectInputSource(target)
-                if let saved {
-                    pb.clearContents()
-                    pb.setString(saved, forType: .string)
-                }
+                self.restoreClipboard(saved)
             }
         }
     }
@@ -1689,7 +1787,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // и посимвольная перепечатка — события уходили быстрее, чем приложение
     // успевало их обработать, отсюда «ККОШКА» вместо «КОШКА». Выделение
     // стрелками плюс одна вставка атомарны и от скорости не зависят.
-    func replaceLast(_ count: Int, with text: String, switchTo target: TISInputSource?) {
+    func replaceLast(_ count: Int, with text: String, switchTo target: TISInputSource?,
+                     guardTick: Int? = nil) {
         guard ensureAccessibility() else { return }
         guard !replaceInProgress else {
             log("замена: предыдущая ещё идёт, пропуск")
@@ -1707,27 +1806,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let pb = NSPasteboard.general
         let saved = pb.string(forType: .string)
         DispatchQueue.global(qos: .userInteractive).async {
+            func typingContinued() -> Bool {
+                guard let guardTick else { return false }
+                return DispatchQueue.main.sync { self.inputTick } != guardTick
+            }
+            func finish(_ note: String?) {
+                DispatchQueue.main.async {
+                    watchdog.cancel()
+                    if let note { self.log(note) }
+                    self.replaceInProgress = false
+                }
+            }
+            // Пользователь мог продолжить печатать, пока мы собирались:
+            // вставка легла бы поверх новых букв
+            if typingContinued() { return finish("замена отменена: печать продолжается") }
+
+            // Стираем именно Backspace: выделение Shift+Влево не работает
+            // в терминалах, а туда конвертация нужна не меньше
             if count > 0 {
-                for _ in 0..<count { self.postKey(123, flags: .maskShift) }  // Shift+Влево
-                usleep(70000)
+                for _ in 0..<count { self.postKey(51) }
+                usleep(50000)
             }
-            DispatchQueue.main.sync {
-                pb.clearContents()
-                pb.setString(text, forType: .string)
-            }
+            DispatchQueue.main.sync { self.writeClipboard(text) }
             usleep(30000)
             self.postKey(9, flags: .maskCommand)  // Cmd+V
             usleep(260000)
             DispatchQueue.main.async {
                 watchdog.cancel()
                 if let target { TISSelectInputSource(target) }
-                if let saved {
-                    pb.clearContents()
-                    pb.setString(saved, forType: .string)
-                }
+                self.restoreClipboard(saved)
                 self.replaceInProgress = false
             }
         }
+    }
+
+    // Помечаем содержимое временным: менеджеры буфера обмена (Raycast,
+    // Alfred, Paste) такие записи в историю не заносят
+    func writeClipboard(_ text: String) {
+        let pb = NSPasteboard.general
+        let transient = NSPasteboard.PasteboardType("org.nspasteboard.TransientType")
+        pb.clearContents()
+        pb.declareTypes([.string, transient], owner: nil)
+        pb.setString(text, forType: .string)
+        pb.setData(Data(), forType: transient)
+    }
+
+    func restoreClipboard(_ saved: String?) {
+        guard let saved else { return }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(saved, forType: .string)
     }
 
     func replaceWithText(backspaces: Int, text: String) {
