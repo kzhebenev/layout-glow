@@ -62,6 +62,8 @@ final class Settings {
             "onboarded": false,
             "perFieldLayout": false,
             "backspaceUndo": false,
+            "dryRun": false,
+            "allowedApps": ["com.termius.mac"],
             "fieldLayouts": [String: String](),
         ])
     }
@@ -106,6 +108,16 @@ final class Settings {
         get { d.bool(forKey: "onboarded") }
         set { d.set(newValue, forKey: "onboarded") }
     }
+    var dryRun: Bool {
+        get { d.bool(forKey: "dryRun") }
+        set { d.set(newValue, forKey: "dryRun") }
+    }
+    // Приложения, где исправление разрешено явно: перевешивает
+    // автоматическое определение терминала
+    var allowedApps: Set<String> {
+        get { Set(d.stringArray(forKey: "allowedApps") ?? []) }
+        set { d.set(Array(newValue).sorted(), forKey: "allowedApps") }
+    }
     var backspaceUndo: Bool {
         get { d.bool(forKey: "backspaceUndo") }
         set { d.set(newValue, forKey: "backspaceUndo") }
@@ -125,8 +137,16 @@ final class Settings {
     }
     func setExcluded(_ bundleID: String, _ excluded: Bool) {
         var s = excludedApps
-        if excluded { s.insert(bundleID) } else { s.remove(bundleID) }
+        var allowed = allowedApps
+        if excluded {
+            s.insert(bundleID)
+            allowed.remove(bundleID)
+        } else {
+            s.remove(bundleID)
+            allowed.insert(bundleID)   // явное разрешение сильнее автоопределения
+        }
         excludedApps = s
+        allowedApps = allowed
     }
 }
 
@@ -206,6 +226,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var onboardingWindow: NSWindow?
     var shortcutsWindow: NSWindow?
     var onboardingTimer: Timer?
+    var smoke: SmokeTest?
 
     // Диагностика
     var keysSeen = 0
@@ -213,7 +234,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var events: [String] = []
 
     func applicationDidFinishLaunching(_ note: Notification) {
-        if Bundle.main.bundlePath.hasSuffix(".app"),
+        if !smokeMode, Bundle.main.bundlePath.hasSuffix(".app"),
            SMAppService.mainApp.status != .enabled {
             try? SMAppService.mainApp.register()
         }
@@ -289,6 +310,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
             AXIsProcessTrustedWithOptions(opts)
         }
+        if smokeMode {
+            log("режим дымовых тестов")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                self.smoke = SmokeTest(delegate: self)
+                self.smoke?.run()
+            }
+            return
+        }
+
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self.checkForUpdates(manual: false) }
         if !Settings.shared.onboarded {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.showOnboarding(activate: false) }
@@ -709,6 +739,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         "com.termius.mac": "Termius",
     ]
 
+    // Терминал определяется по признакам, а не по списку: новые
+    // эмуляторы появляются, а поведение в них нужно осторожное
+    static let terminalHints = ["term", "console", "shell", "ssh", "putty", "iterm",
+                                "warp", "kitty", "ghostty", "tabby", "alacritty", "hyper"]
+
+    func isTerminalLike(_ app: NSRunningApplication?) -> Bool {
+        guard let app else { return false }
+        let identity = ((app.bundleIdentifier ?? "") + " " + (app.localizedName ?? "")).lowercased()
+        if AppDelegate.terminalHints.contains(where: { identity.contains($0) }) { return true }
+        guard let element = focusedElement() else { return false }
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXRoleDescriptionAttribute as CFString, &ref) == .success,
+              let description = ref as? String else { return false }
+        let lowered = description.lowercased()
+        return lowered.contains("terminal") || lowered.contains("терминал")
+            || lowered.contains("console") || lowered.contains("консоль")
+    }
+
+    // Работает ли исправление в этом приложении: явный выбор пользователя
+    // сильнее всего, затем список исключений, затем автоопределение терминала
+    func correctionAllowed(in app: NSRunningApplication?) -> Bool {
+        guard let bid = app?.bundleIdentifier else { return true }
+        if Settings.shared.allowedApps.contains(bid) { return true }
+        if Settings.shared.excludedApps.contains(bid) { return false }
+        return !isTerminalLike(app)
+    }
+
     func isInstalled(_ bundleID: String) -> Bool {
         NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) != nil
     }
@@ -794,9 +851,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         toggle("Автоисправление раскладки", s.autoCorrect, #selector(toggleAuto), icon: "wand.and.stars")
         toggle("Конвертация по двойному Shift", s.manualConvert, #selector(toggleManual), icon: "arrow.2.squarepath")
         toggle("Откат исправления по Backspace", s.backspaceUndo, #selector(toggleBackspaceUndo), icon: "delete.left")
+        toggle("Только показывать, не менять текст", s.dryRun, #selector(toggleDryRun), icon: "eye")
         if let app = frontApp, let bid = app.bundleIdentifier {
             let name = app.localizedName ?? appName(for: bid)
-            toggle("Исправлять в «\(name)»", !s.isExcluded(bid), #selector(toggleFrontApp), icon: "app.badge.checkmark")
+            let mark = (isTerminalLike(app) && !s.allowedApps.contains(bid)) ? " (терминал)" : ""
+            toggle("Исправлять в «\(name)»\(mark)", correctionAllowed(in: app),
+                   #selector(toggleFrontApp), icon: "app.badge.checkmark")
         }
         let excluded = s.excludedApps.filter { isInstalled($0) }.sorted { appName(for: $0) < appName(for: $1) }
         if !excluded.isEmpty {
@@ -867,6 +927,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
         _ = action("Версия \(version) — проверить обновления", #selector(checkUpdatesManually), icon: "arrow.down.circle")
+        _ = action("Вернуться на предыдущую версию…", #selector(rollbackToPrevious), icon: "arrow.uturn.backward",
+                   tooltip: "Скачает и поставит прошлый релиз")
         let quit = NSMenuItem(title: "Выйти", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quit.image = symbol("power")
         menu.addItem(quit)
@@ -878,6 +940,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleAuto() { Settings.shared.autoCorrect.toggle() }
     @objc func toggleManual() { Settings.shared.manualConvert.toggle() }
     @objc func toggleBackspaceUndo() { Settings.shared.backspaceUndo.toggle() }
+    @objc func toggleDryRun() { Settings.shared.dryRun.toggle() }
     @objc func togglePerApp() {
         Settings.shared.perAppLayout.toggle()
         if Settings.shared.perAppLayout { rememberLayout() }
@@ -891,7 +954,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     @objc func toggleFrontApp() {
         guard let bid = frontApp?.bundleIdentifier else { return }
-        Settings.shared.setExcluded(bid, !Settings.shared.isExcluded(bid))
+        Settings.shared.setExcluded(bid, correctionAllowed(in: frontApp))
     }
     @objc func removeExcludedApp(_ sender: NSMenuItem) {
         guard let bid = sender.representedObject as? String else { return }
@@ -1118,7 +1181,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func autoCorrect(_ word: [Stroke], boundary: Stroke? = nil) {
         guard !word.isEmpty, let cur = currentSource(), let other = otherLayout() else { return }
-        if Settings.shared.isExcluded(frontApp?.bundleIdentifier) { return }
+        guard correctionAllowed(in: frontApp) else {
+            log("пропуск: исправление выключено в «\(frontApp?.localizedName ?? "?")»")
+            return
+        }
         if isSecureFieldFocused() {
             log("пропуск: поле для пароля")
             wordBuffer.removeAll(); lastWord = nil
@@ -1164,6 +1230,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             lastWordTrailing = boundaryText.count
 
             let replacement = converted + tail + boundaryText
+            if Settings.shared.dryRun {
+                log("сухой прогон: заменил бы «\(typed)» на «\(converted)»")
+                showPill(text: converted, color: .systemGray)
+                return
+            }
             pendingUndo = PendingUndo(corrected: replacement, original: full + boundaryText,
                                       word: typed, layoutID: currentLayoutFullID(),
                                       bundleID: frontApp?.bundleIdentifier,
@@ -1988,6 +2059,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }.resume()
     }
 
+    // Откат на предыдущий релиз: если обновление оказалось хуже,
+    // ждать исправления не нужно
+    @objc func rollbackToPrevious() {
+        guard let url = URL(string: "https://api.github.com/repos/kzhebenev/layout-glow/releases?per_page=10") else { return }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 10
+        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+            guard let self else { return }
+            let current = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
+            guard let data,
+                  let list = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+                DispatchQueue.main.async { self.alert("Не удалось получить список версий", "Проверьте сеть.") }
+                return
+            }
+            // Первая версия, которая старше установленной
+            let candidates = list.compactMap { release -> (String, String)? in
+                guard let tag = release["tag_name"] as? String else { return nil }
+                let version = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+                guard version.compare(current, options: .numeric) == .orderedAscending else { return nil }
+                let assets = release["assets"] as? [[String: Any]] ?? []
+                guard let dmg = assets.first(where: { ($0["name"] as? String)?.hasSuffix(".dmg") == true }),
+                      let link = dmg["browser_download_url"] as? String else { return nil }
+                return (version, link)
+            }
+            guard let previous = candidates.first else {
+                DispatchQueue.main.async {
+                    self.alert("Откатываться некуда", "Более ранних версий с готовой сборкой не нашлось.")
+                }
+                return
+            }
+            DispatchQueue.main.async {
+                NSApp.activate(ignoringOtherApps: true)
+                let dialog = NSAlert()
+                dialog.messageText = "Вернуться на версию \(previous.0)?"
+                dialog.informativeText = "Установлена \(current). Приложение перезапустится."
+                dialog.addButton(withTitle: "Вернуться")
+                dialog.addButton(withTitle: "Отмена")
+                if dialog.runModal() == .alertFirstButtonReturn {
+                    self.log("откат на версию \(previous.0)")
+                    self.downloadAndInstall(previous.1)
+                }
+            }
+        }.resume()
+    }
+
     func alert(_ title: String, _ text: String) {
         NSApp.activate(ignoringOtherApps: true)
         let a = NSAlert()
@@ -2007,8 +2123,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 
+let smokeMode = CommandLine.arguments.contains("--smoke-test")
 let app = NSApplication.shared
-app.setActivationPolicy(.accessory)
+app.setActivationPolicy(smokeMode ? .regular : .accessory)
 let delegate = AppDelegate()
 app.delegate = delegate
 app.run()
