@@ -23,8 +23,9 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
     <key>CFBundleExecutable</key><string>LayoutGlow</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>4.7</string>
-    <key>CFBundleVersion</key><string>26</string>
+    <key>CFBundleShortVersionString</key><string>4.8</string>
+    <key>CFBundleVersion</key><string>27</string>
+    <key>NSHumanReadableCopyright</key><string>© 2026 Константин Жебенев. Лицензия MIT.</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>LSUIElement</key><true/>
     <key>NSHighResolutionCapable</key><true/>
@@ -37,6 +38,7 @@ if [ ! -f "$DIR/icon/AppIcon.icns" ] || [ "$DIR/icon/make-icon.swift" -nt "$DIR/
     (cd "$DIR" && swift icon/make-icon.swift >/dev/null && iconutil -c icns icon/AppIcon.iconset -o icon/AppIcon.icns)
 fi
 cp "$DIR/icon/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+cp "$DIR/LICENSE" "$APP/Contents/Resources/LICENSE"
 
 # Подпись постоянным самоподписанным сертификатом: без неё каждая пересборка
 # меняет хеш бинарника и macOS сбрасывает выданные разрешения.

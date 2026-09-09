@@ -53,6 +53,7 @@ final class PreferencesWindow: NSObject, NSTableViewDataSource, NSTableViewDeleg
         tabs.addTabViewItem(tab("Пресеты", view: presetsView()))
         tabs.addTabViewItem(tab("Сочетания", view: hotkeysView()))
         tabs.addTabViewItem(tab("Обслуживание", view: maintenanceView()))
+        tabs.addTabViewItem(tab("Справка", view: helpView()))
         window.contentView = tabs
     }
 
@@ -380,6 +381,136 @@ final class PreferencesWindow: NSObject, NSTableViewDataSource, NSTableViewDeleg
             try? data.write(to: supportDirectory().appendingPathComponent("snapshot-\(name).png"))
         }
         if let selected { tabs.selectTabViewItem(selected) }
+    }
+
+    // MARK: Справка
+
+    private func helpView() -> NSView {
+        let container = NSView()
+
+        let text = NSTextView()
+        text.isEditable = false
+        text.drawsBackground = false
+        text.textContainerInset = NSSize(width: 14, height: 12)
+        text.textStorage?.setAttributedString(helpText())
+
+        let scroll = NSScrollView()
+        scroll.documentView = text
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(scroll)
+
+        func button(_ title: String, _ selector: Selector) -> NSButton {
+            let b = NSButton(title: title, target: self, action: selector)
+            b.bezelStyle = .rounded
+            return b
+        }
+        let row = NSStackView(views: [
+            button("Сочетания…", #selector(openShortcutsWindow)),
+            button("Разрешения…", #selector(openPermissions)),
+            button("Страница проекта", #selector(openProjectPage)),
+            button("Лицензия", #selector(openLicense)),
+        ])
+        row.orientation = .horizontal
+        row.spacing = 8
+        row.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(row)
+
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        let footer = NSTextField(labelWithString:
+            "LayoutGlow \(version). © 2026 Константин Жебенев. Лицензия MIT — пользуйтесь и меняйте свободно.")
+        footer.font = .systemFont(ofSize: 11)
+        footer.textColor = .secondaryLabelColor
+        footer.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(footer)
+
+        NSLayoutConstraint.activate([
+            scroll.topAnchor.constraint(equalTo: container.topAnchor, constant: 16),
+            scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 18),
+            scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -18),
+            scroll.bottomAnchor.constraint(equalTo: row.topAnchor, constant: -12),
+            row.leadingAnchor.constraint(equalTo: scroll.leadingAnchor),
+            row.bottomAnchor.constraint(equalTo: footer.topAnchor, constant: -8),
+            footer.leadingAnchor.constraint(equalTo: scroll.leadingAnchor),
+            footer.trailingAnchor.constraint(lessThanOrEqualTo: scroll.trailingAnchor),
+            footer.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -16),
+        ])
+        return container
+    }
+
+    private func helpText() -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        func heading(_ text: String) {
+            result.append(NSAttributedString(string: text + "\n", attributes: [
+                .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
+                .foregroundColor: NSColor.labelColor,
+            ]))
+        }
+        func body(_ text: String) {
+            let style = NSMutableParagraphStyle()
+            style.paragraphSpacing = 10
+            style.lineSpacing = 2
+            result.append(NSAttributedString(string: text + "\n", attributes: [
+                .font: NSFont.systemFont(ofSize: 12),
+                .foregroundColor: NSColor.labelColor,
+                .paragraphStyle: style,
+            ]))
+        }
+
+        heading("Что видно на экране")
+        body("Свечение вдоль нижнего края показывает раскладку: оранжевое — русская, синее — английская, "
+             + "красное — включён Caps Lock. При переключении рядом с курсором всплывает ярлык, "
+             + "а текущая раскладка всегда видна в строке меню.")
+
+        heading("Переключение")
+        body("Тап по клавише Fn меняет раскладку мгновенно — системную задержку это обходит. "
+             + "Чтобы работало, в системных настройках клавиатуры «Press Globe key to» должно стоять «Do Nothing». "
+             + "Приложение умеет запоминать раскладку для каждой программы, а правила в файле layout-rules.txt "
+             + "задают её жёстко: например, в терминале всегда английская.")
+
+        heading("Исправление раскладки")
+        body("Слово проверяется, когда вы ставите пробел или знак вроде запятой и восклицательного знака. "
+             + "Если набранное бессмысленно, а в другой раскладке получается словарное слово, оно заменяется само. "
+             + "Двойной Shift конвертирует выделенный текст, а без выделения — слово, которое вы набираете "
+             + "или набрали последним. Повторный двойной Shift после исправления возвращает написание "
+             + "и заносит слово в исключения навсегда.")
+
+        heading("Что остаётся нетронутым")
+        body("Поля для паролей, включая веб-формы под звёздочками. Ссылки, адреса почты и пути. "
+             + "Аббревиатуры заглавными буквами. Слова из файла исключений. Приложения, для которых вы "
+             + "выключили исправление; незнакомые терминалы выключаются сами. "
+             + "IP-адреса, наоборот, чинятся: «192ю168ю2ю1» станет «192.168.2.1».")
+
+        heading("Вставки, пресеты и буфер обмена")
+        body("Ключ из словаря вставок разворачивается в текст по Cmd+Option+0: наберите «кж» и нажмите сочетание. "
+             + "Десять пресетов вставляются по Ctrl+Option+Cmd+цифра. "
+             + "История буфера обмена открывается по Ctrl+Option+Cmd+V: цифры 1-9 вставляют запись, Esc закрывает. "
+             + "Записи из менеджеров паролей в историю не попадают.")
+
+        heading("Если что-то пошло не так")
+        body("На вкладке «Обслуживание» есть история исправлений — там видно, что и где менялось и не сорвалась ли "
+             + "замена. Там же журнал состояния, кнопка самопроверки и возврат на предыдущую версию. "
+             + "Режим «только показывать» на вкладке «Поведение» даёт посмотреть, что приложение сделало бы, "
+             + "не трогая текст.")
+
+        heading("Обновления")
+        body("Приложение проверяет релизы при запуске и обновляется само. После обновления оно дожидается, "
+             + "когда вы отойдёте от компьютера, прогоняет самопроверку и при неудаче возвращается на прошлую версию.")
+
+        return result
+    }
+
+    @objc private func openShortcutsWindow() { delegate.showShortcuts() }
+    @objc private func openProjectPage() {
+        NSWorkspace.shared.open(URL(string: "https://github.com/kzhebenev/layout-glow")!)
+    }
+    @objc private func openLicense() {
+        if let bundled = Bundle.main.url(forResource: "LICENSE", withExtension: nil) {
+            NSWorkspace.shared.open(bundled)
+        } else {
+            NSWorkspace.shared.open(URL(string: "https://github.com/kzhebenev/layout-glow/blob/main/LICENSE")!)
+        }
     }
 
     // MARK: Общее

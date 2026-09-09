@@ -979,6 +979,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
         _ = action("Версия \(version) — проверить обновления", #selector(checkUpdatesManually), icon: "arrow.down.circle")
+        let copyright = NSMenuItem(title: "© 2026 Константин Жебенев, лицензия MIT", action: nil, keyEquivalent: "")
+        copyright.attributedTitle = NSAttributedString(
+            string: "© 2026 Константин Жебенев, лицензия MIT",
+            attributes: [.font: NSFont.systemFont(ofSize: 11),
+                         .foregroundColor: NSColor.tertiaryLabelColor])
+        copyright.isEnabled = false
+        menu.addItem(copyright)
         let quit = NSMenuItem(title: "Выйти", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quit.image = symbol("power")
         menu.addItem(quit)
