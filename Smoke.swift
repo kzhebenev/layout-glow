@@ -41,6 +41,78 @@ final class SmokeTest {
                  input: "rjirf", expected: "кошка", doubleShift: true),
     ]
 
+    // Расширенный прогон: те же сценарии, но в настоящем приложении.
+    // Собственное окно не воспроизводит поведение чужих текстовых полей,
+    // а ломалось у пользователя именно там
+    func runInTextEdit() {
+        say("расширенный прогон в TextEdit")
+        let path = FileManager.default.temporaryDirectory.appendingPathComponent("layoutglow-smoke.txt")
+        try? "".write(to: path, atomically: true, encoding: .utf8)
+        NSWorkspace.shared.open(path)
+        usleep(2500000)
+
+        guard let textEdit = NSRunningApplication.runningApplications(
+                withBundleIdentifier: "com.apple.TextEdit").first else {
+            say("ПРОВАЛ: TextEdit не запустился")
+            failures += 1
+            return
+        }
+        DispatchQueue.main.sync { self.delegate.frontApp = textEdit }
+
+        for scenario in scenarios where !scenario.doubleShift {
+            textEdit.activate()
+            usleep(400000)
+            selectAllAndDelete()
+            let prepared: [Stroke]? = DispatchQueue.main.sync {
+                guard let layout = delegate.source(forLanguage: scenario.language) else { return nil }
+                TISSelectInputSource(layout)
+                delegate.wordBuffer.removeAll()
+                delegate.lastWord = nil
+                return scenario.input.map { character in
+                    character == " "
+                        ? Stroke(keycode: 49, shift: false, caps: false)
+                        : (stroke(for: character, in: layout) ?? Stroke(keycode: 49, shift: false, caps: false))
+                }
+            }
+            guard let strokes = prepared else { continue }
+            usleep(250000)
+            for s in strokes {
+                postRaw(s.keycode, flags: s.shift ? [.maskShift] : [])
+                usleep(25000)
+            }
+            usleep(900000)
+            let actual = (try? String(contentsOf: path, encoding: .utf8)) ?? readTextEditValue(textEdit) ?? ""
+            report(scenario, actual: actual.isEmpty ? readTextEditValue(textEdit) ?? "" : actual,
+                   passed: (actual.isEmpty ? readTextEditValue(textEdit) ?? "" : actual) == scenario.expected)
+        }
+
+        // Закрываем без сохранения
+        postRaw(13, flags: [.maskCommand])   // Cmd+W
+        usleep(400000)
+        postRaw(53, flags: [])               // Esc на случай диалога
+        try? FileManager.default.removeItem(at: path)
+    }
+
+    func selectAllAndDelete() {
+        postRaw(0, flags: [.maskCommand])    // Cmd+A
+        usleep(120000)
+        postRaw(51, flags: [])               // Backspace
+        usleep(150000)
+    }
+
+    // Читаем содержимое окна TextEdit через Универсальный доступ
+    func readTextEditValue(_ app: NSRunningApplication) -> String? {
+        let element = AXUIElementCreateApplication(app.processIdentifier)
+        var focusedRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXFocusedUIElementAttribute as CFString,
+                                            &focusedRef) == .success,
+              let f = focusedRef, CFGetTypeID(f) == AXUIElementGetTypeID() else { return nil }
+        var valueRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(f as! AXUIElement, kAXValueAttribute as CFString,
+                                            &valueRef) == .success else { return nil }
+        return valueRef as? String
+    }
+
     func run() {
         buildWindow()
         DispatchQueue.global(qos: .userInitiated).async {
@@ -61,6 +133,7 @@ final class SmokeTest {
             }
             self.say("состояние — " + state)
             for scenario in self.scenarios { self.execute(scenario) }
+            if CommandLine.arguments.contains("--in-apps") { self.runInTextEdit() }
             let events = DispatchQueue.main.sync { self.delegate.events }
             if self.failures > 0 {
                 self.say("--- журнал приложения ---")

@@ -222,6 +222,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var clipboardBackup: String?
     var inputTick = 0            // растёт на каждом настоящем нажатии
     var slowTick = 0
+    var lastStatusText = ""
+    var corrections: [String] = []
+    var pausedForSmoke = false
+    var verifyArmed = false
     var pendingUndo: PendingUndo?
     var onboardingWindow: NSWindow?
     var shortcutsWindow: NSWindow?
@@ -300,10 +304,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
+        loadCorrections()
         startTap()
         registerSlotHotkeys()
         AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.4)
-        Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.writeStatus() }
+        Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.writeStatus() }
         writeStatus()
 
         if !AXIsProcessTrusted() {
@@ -320,6 +325,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self.checkForUpdates(manual: false) }
+        armPostUpdateCheck()
         if !Settings.shared.onboarded {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.showOnboarding(activate: false) }
         }
@@ -703,6 +709,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         writeStatus()
     }
 
+    // История исправлений: последние строки живут долго, в отличие от
+    // сорока событий в status.log, которые вытесняются за минуту
+    func recordCorrection(_ line: String) {
+        let path = supportDirectory().appendingPathComponent("corrections.log")
+        let stamp = DateFormatter.localizedString(from: Date(), dateStyle: .short, timeStyle: .medium)
+        let app = frontApp?.localizedName ?? "?"
+        corrections.append("\(stamp)  [\(app)]  \(line)")
+        if corrections.count > 500 { corrections.removeFirst(corrections.count - 500) }
+        try? corrections.joined(separator: "\n").appending("\n").write(to: path, atomically: true, encoding: .utf8)
+    }
+
+    func loadCorrections() {
+        let path = supportDirectory().appendingPathComponent("corrections.log")
+        guard let text = try? String(contentsOf: path, encoding: .utf8) else { return }
+        corrections = text.split(separator: "\n").map(String.init).suffix(500).map { $0 }
+    }
+
     func writeStatus() {
         let fnUsage = CFPreferencesCopyAppValue("AppleFnUsageType" as CFString,
                                                 "com.apple.HIToolbox" as CFString) as? Int ?? -1
@@ -723,6 +746,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         события:
         """
         text += "\n" + events.joined(separator: "\n") + "\n"
+        // Пишем только когда что-то изменилось: файл раз в две секунды
+        // впустую крутил диск и будил систему
+        guard text != lastStatusText else { return }
+        lastStatusText = text
         try? text.write(to: supportDirectory().appendingPathComponent("status.log"),
                         atomically: true, encoding: .utf8)
     }
@@ -929,6 +956,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ = action("Версия \(version) — проверить обновления", #selector(checkUpdatesManually), icon: "arrow.down.circle")
         _ = action("Вернуться на предыдущую версию…", #selector(rollbackToPrevious), icon: "arrow.uturn.backward",
                    tooltip: "Скачает и поставит прошлый релиз")
+        _ = action("Проверить себя сейчас", #selector(runSelfCheckNow), icon: "checkmark.circle",
+                   tooltip: "Прогонит дымовые тесты в отдельном окне")
+        _ = action("История исправлений…", #selector(openCorrections), icon: "clock.arrow.circlepath")
         let quit = NSMenuItem(title: "Выйти", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quit.image = symbol("power")
         menu.addItem(quit)
@@ -965,6 +995,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func openSnippets() { NSWorkspace.shared.open(snippetsFile.url) }
     @objc func openRules() { NSWorkspace.shared.open(rulesFile.url) }
     @objc func openHotkeys() { NSWorkspace.shared.open(hotkeysFile.url) }
+    @objc func openCorrections() {
+        NSWorkspace.shared.open(supportDirectory().appendingPathComponent("corrections.log"))
+    }
     @objc func reloadDictionaries() {
         exceptionsFile.reload(force: true)
         commandsFile.reload(force: true)
@@ -1028,6 +1061,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         if event.getIntegerValueField(.eventSourceUserData) == syntheticMagic { return }
+        if pausedForSmoke { return }
 
         if type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown {
             wordBuffer.removeAll(); lastWord = nil
@@ -1907,6 +1941,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if let target { TISSelectInputSource(target) }
                 self.restoreClipboard(saved)
                 self.replaceInProgress = false
+                self.verifyReplacement(expected: text)
+            }
+        }
+    }
+
+    // Что стоит перед курсором: по этому проверяем, что замена дошла
+    func textBeforeCaret(_ length: Int) -> String? {
+        guard length > 0, let element = focusedElement() else { return nil }
+        var rangeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success,
+              let rv = rangeRef, CFGetTypeID(rv) == AXValueGetTypeID() else { return nil }
+        var caret = CFRange()
+        AXValueGetValue(rv as! AXValue, .cfRange, &caret)
+        let available = min(length, caret.location)
+        guard available > 0 else { return nil }
+        var range = CFRange(location: caret.location - available, length: available)
+        guard let value = AXValueCreate(.cfRange, &range) else { return nil }
+        var textRef: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(
+                element, kAXStringForRangeParameterizedAttribute as CFString, value, &textRef) == .success,
+              let text = textRef as? String else { return nil }
+        return text
+    }
+
+    // Приложение могло проглотить наши нажатия и промолчать — раньше такие
+    // сбои были невидимы и выглядели как «иногда не срабатывает»
+    func verifyReplacement(expected: String) {
+        guard !expected.isEmpty else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            guard let actual = self.textBeforeCaret(expected.count) else {
+                self.recordCorrection("«\(expected.trimmingCharacters(in: .whitespaces))» — проверить не удалось")
+                return
+            }
+            if actual == expected {
+                self.recordCorrection("«\(expected.trimmingCharacters(in: .whitespaces))» — заменено")
+            } else {
+                self.log("замена не подтвердилась: ожидалось «\(expected)», в тексте «\(actual)»")
+                self.recordCorrection("«\(expected.trimmingCharacters(in: .whitespaces))» — НЕ УДАЛОСЬ, в тексте «\(actual)»")
+                self.showPill(text: "не удалось", color: .systemRed)
             }
         }
     }
@@ -2059,22 +2132,89 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }.resume()
     }
 
-    // Откат на предыдущий релиз: если обновление оказалось хуже,
-    // ждать исправления не нужно
-    @objc func rollbackToPrevious() {
-        guard let url = URL(string: "https://api.github.com/repos/kzhebenev/layout-glow/releases?per_page=10") else { return }
+    // После обновления прогоняем дымовые тесты и, если новая версия
+    // сломана, сами возвращаемся на предыдущую. Ждём простоя: тест
+    // печатает в собственное окно и мешать работе не должен
+    func armPostUpdateCheck() {
+        let current = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
+        guard UserDefaults.standard.string(forKey: "lastVerifiedVersion") != current else { return }
+        verifyArmed = true
+        log("версия \(current) ещё не проверена, жду простоя")
+        Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] timer in
+            guard let self, self.verifyArmed else { timer.invalidate(); return }
+            let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState,
+                                                               eventType: .init(rawValue: ~0)!)
+            guard idle > 45, !self.replaceInProgress else { return }
+            self.verifyArmed = false
+            timer.invalidate()
+            self.runSelfCheck()
+        }
+    }
+
+    func runSelfCheck() {
+        let current = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
+        log("самопроверка версии \(current)")
+        pausedForSmoke = true
+        let report = supportDirectory().appendingPathComponent("smoke.log")
+        try? FileManager.default.removeItem(at: report)
+
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        task.arguments = ["-n", "-W", "-a", "/Applications/LayoutGlow.app", "--args", "--smoke-test"]
+        task.terminationHandler = { [weak self] process in
+            guard let self else { return }
+            let text = (try? String(contentsOf: report, encoding: .utf8)) ?? ""
+            let failed = process.terminationStatus != 0 || text.contains("Провалено")
+            DispatchQueue.main.async {
+                self.pausedForSmoke = false
+                if failed {
+                    self.log("самопроверка провалена, откатываюсь")
+                    self.recordCorrection("самопроверка версии \(current) провалена — откат")
+                    self.notify("LayoutGlow: версия \(current) не прошла самопроверку",
+                                "Возвращаюсь на предыдущую версию.")
+                    self.rollbackAutomatically()
+                } else {
+                    UserDefaults.standard.set(current, forKey: "lastVerifiedVersion")
+                    self.log("самопроверка версии \(current) пройдена")
+                }
+            }
+        }
+        do { try task.run() } catch {
+            pausedForSmoke = false
+            log("самопроверку запустить не удалось: \(error.localizedDescription)")
+        }
+    }
+
+    func notify(_ title: String, _ text: String) {
+        let notification = NSUserNotification()
+        notification.title = title
+        notification.informativeText = text
+        NSUserNotificationCenter.default.deliver(notification)
+    }
+
+    func rollbackAutomatically() {
+        previousRelease { [weak self] release in
+            guard let self, let release else { return }
+            self.log("автооткат на версию \(release.0)")
+            self.downloadAndInstall(release.1)
+        }
+    }
+
+    // Ближайший релиз старше установленного, у которого есть готовая сборка
+    func previousRelease(_ completion: @escaping ((String, String)?) -> Void) {
+        guard let url = URL(string: "https://api.github.com/repos/kzhebenev/layout-glow/releases?per_page=10") else {
+            completion(nil); return
+        }
         var request = URLRequest(url: url)
         request.timeoutInterval = 10
-        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
-            guard let self else { return }
+        URLSession.shared.dataTask(with: request) { data, _, _ in
             let current = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
             guard let data,
                   let list = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
-                DispatchQueue.main.async { self.alert("Не удалось получить список версий", "Проверьте сеть.") }
+                DispatchQueue.main.async { completion(nil) }
                 return
             }
-            // Первая версия, которая старше установленной
-            let candidates = list.compactMap { release -> (String, String)? in
+            let found = list.compactMap { release -> (String, String)? in
                 guard let tag = release["tag_name"] as? String else { return nil }
                 let version = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
                 guard version.compare(current, options: .numeric) == .orderedAscending else { return nil }
@@ -2082,27 +2222,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard let dmg = assets.first(where: { ($0["name"] as? String)?.hasSuffix(".dmg") == true }),
                       let link = dmg["browser_download_url"] as? String else { return nil }
                 return (version, link)
-            }
-            guard let previous = candidates.first else {
-                DispatchQueue.main.async {
-                    self.alert("Откатываться некуда", "Более ранних версий с готовой сборкой не нашлось.")
-                }
-                return
-            }
-            DispatchQueue.main.async {
-                NSApp.activate(ignoringOtherApps: true)
-                let dialog = NSAlert()
-                dialog.messageText = "Вернуться на версию \(previous.0)?"
-                dialog.informativeText = "Установлена \(current). Приложение перезапустится."
-                dialog.addButton(withTitle: "Вернуться")
-                dialog.addButton(withTitle: "Отмена")
-                if dialog.runModal() == .alertFirstButtonReturn {
-                    self.log("откат на версию \(previous.0)")
-                    self.downloadAndInstall(previous.1)
-                }
-            }
+            }.first
+            DispatchQueue.main.async { completion(found) }
         }.resume()
     }
+
+    // Откат на предыдущий релиз: если обновление оказалось хуже,
+    // ждать исправления не нужно
+    @objc func rollbackToPrevious() {
+        previousRelease { [weak self] release in
+            guard let self else { return }
+            let current = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
+            guard let release else {
+                self.alert("Откатываться некуда", "Более ранних версий с готовой сборкой не нашлось.")
+                return
+            }
+            NSApp.activate(ignoringOtherApps: true)
+            let dialog = NSAlert()
+            dialog.messageText = "Вернуться на версию \(release.0)?"
+            dialog.informativeText = "Установлена \(current). Приложение перезапустится."
+            dialog.addButton(withTitle: "Вернуться")
+            dialog.addButton(withTitle: "Отмена")
+            if dialog.runModal() == .alertFirstButtonReturn {
+                self.log("откат на версию \(release.0)")
+                self.downloadAndInstall(release.1)
+            }
+        }
+    }
+
+    @objc func runSelfCheckNow() { runSelfCheck() }
 
     func alert(_ title: String, _ text: String) {
         NSApp.activate(ignoringOtherApps: true)

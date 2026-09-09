@@ -1,6 +1,7 @@
 #!/bin/bash
 # Дымовые тесты на живом текстовом поле: печатает в собственное окно
-# и проверяет результат. Работающее приложение на время останавливается,
+# и проверяет результат. С ключом --in-apps дополнительно прогоняет
+# те же сценарии в TextEdit — чужие поля ведут себя иначе. Работающее приложение на время останавливается,
 # иначе исправлять будут сразу два экземпляра.
 set -uo pipefail
 
@@ -20,7 +21,9 @@ if pgrep -x LayoutGlow >/dev/null; then WAS_RUNNING=1; pkill -x LayoutGlow; slee
 # и приложение не сможет ни печатать, ни читать поле
 LOG="$HOME/Library/Application Support/LayoutGlow/smoke.log"
 rm -f "$LOG"
-open -n -W -a "$APP" --args --smoke-test
+EXTRA=""
+[ "${1:-}" = "--in-apps" ] && EXTRA="--in-apps"
+open -n -W -a "$APP" --args --smoke-test $EXTRA
 STATUS=0
 if [ -f "$LOG" ]; then
     cat "$LOG"
