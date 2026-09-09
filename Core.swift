@@ -304,6 +304,16 @@ final class WordFile {
         }
     }
 
+    func replaceAll(_ list: [String]) {
+        let comments = (try? String(contentsOf: url, encoding: .utf8))?
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .prefix { $0.trimmingCharacters(in: .whitespaces).hasPrefix("#") }
+            .map(String.init) ?? []
+        try? (comments + list).joined(separator: "\n").appending("\n")
+            .write(to: url, atomically: true, encoding: .utf8)
+        reload(force: true)
+    }
+
     func remove(_ word: String) {
         let w = word.lowercased()
         words.remove(w)
@@ -353,6 +363,18 @@ final class SnippetFile {
     }
 
     func value(for key: String) -> String? { items[key.lowercased()] }
+
+    // Переписываем файл целиком, сохраняя строки-комментарии сверху
+    func replaceAll(_ pairs: [(String, String)]) {
+        let comments = (try? String(contentsOf: url, encoding: .utf8))?
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .prefix { $0.trimmingCharacters(in: .whitespaces).hasPrefix("#") }
+            .map(String.init) ?? []
+        let body = pairs.map { "\($0.0) = \($0.1)" }
+        try? (comments + body).joined(separator: "\n").appending("\n")
+            .write(to: url, atomically: true, encoding: .utf8)
+        reload(force: true)
+    }
 
     // true, если файл изменился с прошлой проверки (нужно перерегистрировать сочетания)
     func reloadIfChanged() -> Bool {

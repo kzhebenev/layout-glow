@@ -231,6 +231,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var shortcutsWindow: NSWindow?
     var onboardingTimer: Timer?
     var smoke: SmokeTest?
+    var preferences: PreferencesWindow?
 
     // Диагностика
     var keysSeen = 0
@@ -261,6 +262,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DistributedNotificationCenter.default().addObserver(
             self, selector: #selector(showOnboardingFromMenu),
             name: NSNotification.Name("ru.devkz.layoutglow.setup"),
+            object: nil, suspensionBehavior: .deliverImmediately)
+        DistributedNotificationCenter.default().addObserver(
+            self, selector: #selector(showPreferences),
+            name: NSNotification.Name("ru.devkz.layoutglow.prefs"),
             object: nil, suspensionBehavior: .deliverImmediately)
         DistributedNotificationCenter.default().addObserver(
             self, selector: #selector(showShortcuts),
@@ -899,42 +904,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.setSubmenu(sub, for: head)
         }
 
-        header("Вид")
-        toggle("Ярлык раскладки у курсора", s.caretDot, #selector(toggleCaret), icon: "smallcircle.filled.circle")
-        toggle("Подсветка Caps Lock", s.capsGlow, #selector(toggleCaps), icon: "capslock")
-
-        header("Словари и сочетания")
-        let dictHead = action("Файлы словарей", #selector(doNothing), icon: "folder")
-        let dicts = NSMenu()
-        _ = action("Исключения (\(exceptionsFile.words.count))…", #selector(openExceptions), into: dicts)
-        _ = action("Системные команды (\(commandsFile.words.count))…", #selector(openCommands), into: dicts)
-        _ = action("Вставки (\(snippetsFile.items.count))…", #selector(openSnippets), into: dicts)
-        _ = action("Правила раскладок (\(rulesFile.items.count))…", #selector(openRules), into: dicts)
-        _ = action("Сочетания клавиш…", #selector(openHotkeys), into: dicts)
-        dicts.addItem(.separator())
-        _ = action("Перечитать файлы", #selector(reloadDictionaries), into: dicts)
-        _ = action("Проверить ярлык у курсора", #selector(testDot), into: dicts)
-        menu.setSubmenu(dicts, for: dictHead)
-
-        toggle("Хранить в iCloud", s.iCloudSync, #selector(toggleICloud), icon: "icloud")
-
-        let slots = (1...9).compactMap { n -> (Int, String)? in
-            guard let v = snippetsFile.value(for: String(n)) else { return nil }
-            return (n, v)
-        }
-        if !slots.isEmpty {
-            let head = action("Быстрые вставки (\(slots.count))", #selector(doNothing), icon: "text.badge.plus")
-            let sub = NSMenu()
-            for (n, value) in slots {
-                let short = value.count > 40 ? String(value.prefix(40)) + "…" : value
-                let i = NSMenuItem(title: "\(n) — \(short)", action: #selector(insertSlotItem(_:)), keyEquivalent: "")
-                i.target = self
-                i.representedObject = n
-                i.toolTip = hotkeysFile.value(for: "слот-\(n)") ?? "cmd+opt+\(n)"
-                sub.addItem(i)
-            }
-            menu.setSubmenu(sub, for: head)
-        }
+        menu.addItem(.separator())
+        let preferencesItem = NSMenuItem(title: "Настройки…", action: #selector(showPreferences), keyEquivalent: ",")
+        preferencesItem.target = self
+        preferencesItem.image = symbol("gearshape")
+        menu.addItem(preferencesItem)
         _ = action("Справка по сочетаниям…", #selector(showShortcuts), icon: "questionmark.circle")
 
         menu.addItem(.separator())
@@ -954,11 +928,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
         _ = action("Версия \(version) — проверить обновления", #selector(checkUpdatesManually), icon: "arrow.down.circle")
-        _ = action("Вернуться на предыдущую версию…", #selector(rollbackToPrevious), icon: "arrow.uturn.backward",
-                   tooltip: "Скачает и поставит прошлый релиз")
-        _ = action("Проверить себя сейчас", #selector(runSelfCheckNow), icon: "checkmark.circle",
-                   tooltip: "Прогонит дымовые тесты в отдельном окне")
-        _ = action("История исправлений…", #selector(openCorrections), icon: "clock.arrow.circlepath")
         let quit = NSMenuItem(title: "Выйти", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quit.image = symbol("power")
         menu.addItem(quit)
@@ -2251,6 +2220,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func runSelfCheckNow() { runSelfCheck() }
+
+    @objc func showPreferences() {
+        if preferences == nil { preferences = PreferencesWindow(delegate: self) }
+        preferences?.show()
+    }
 
     func alert(_ title: String, _ text: String) {
         NSApp.activate(ignoringOtherApps: true)

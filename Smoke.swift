@@ -229,7 +229,7 @@ final class SmokeTest {
         if scenario.doubleShift { tapShiftTwice() }
         usleep(900000)
 
-        let actual = DispatchQueue.main.sync { field.stringValue }
+        let actual = DispatchQueue.main.sync { self.currentText() }
         report(scenario, actual: actual, passed: actual == scenario.expected)
     }
 
@@ -254,6 +254,15 @@ final class SmokeTest {
             }
             usleep(80000)
         }
+    }
+
+    // Пока поле редактируется, stringValue отдаёт последнее зафиксированное
+    // значение и бывает пустым — живой текст лежит в редакторе поля
+    func currentText() -> String {
+        if let editor = window.fieldEditor(false, for: field) as? NSTextView {
+            return editor.string
+        }
+        return field.stringValue
     }
 
     func report(_ scenario: Scenario, actual: String, passed: Bool) {
