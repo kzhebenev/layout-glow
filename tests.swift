@@ -99,6 +99,17 @@ let hotkeys = SnippetFile.parse(defaultHotkeys.joined(separator: "\n"))
 check(hotkeys.count == 12, "сочетания: 12 действий по умолчанию")
 check(hotkeys.allSatisfy { parseHotkey($0.value) != nil }, "сочетания: все значения разбираются")
 
+// Адреса и номера версий, набранные не в той раскладке
+expect(typed: "192ю168ю2ю1", converted: "192.168.2.1", src: "ru", dst: "en", correct: true)
+expect(typed: "192ю168ю2ю47:5000", converted: "192.168.2.47:5000", src: "ru", dst: "en", correct: true)
+expect(typed: "1ю2ю3", converted: "1.2.3", src: "ru", dst: "en", correct: true)
+expect(typed: "192.168.2.1", converted: "192ю168ю2ю1", src: "en", dst: "ru", correct: false)
+check(looksLikeDottedNumber("192.168.2.1"), "адрес: обычный IPv4")
+check(looksLikeDottedNumber("10.0.0.1:8080"), "адрес: с портом")
+check(!looksLikeDottedNumber("192.168"), "адрес: двух групп мало")
+check(!looksLikeDottedNumber("привет.как.дела"), "адрес: буквы не считаются")
+check(!looksLikeDottedNumber("1.2.3.4567"), "адрес: группа длиннее трёх цифр")
+
 // Ссылки, почта и национальные домены
 check(looksTechnical("http://vk.com"), "ссылка со схемой")
 check(looksTechnical("www.google.com"), "ссылка с www")

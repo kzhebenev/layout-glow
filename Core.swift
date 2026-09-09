@@ -187,6 +187,23 @@ func meaningful(_ s: String, lang: String, commands: Set<String> = []) -> Bool {
     }
 }
 
+// IP-адрес или номер версии: три и более групп цифр через точку,
+// возможен порт. Набранное в русской раскладке выглядит как
+// «192ю168ю2ю1» — словом это никогда не будет, и правило безопасно
+func looksLikeDottedNumber(_ s: String) -> Bool {
+    let body = s.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+    guard let address = body.first, !address.isEmpty else { return false }
+    if body.count == 2 {
+        let port = body[1]
+        guard !port.isEmpty, port.allSatisfy({ $0.isNumber }) else { return false }
+    }
+    let groups = address.split(separator: ".", omittingEmptySubsequences: false)
+    guard groups.count >= 3 else { return false }
+    return groups.allSatisfy { group in
+        !group.isEmpty && group.count <= 3 && group.allSatisfy { $0.isNumber }
+    }
+}
+
 // MARK: - Решение об автоисправлении
 
 struct Decision {
@@ -200,6 +217,11 @@ func correctionDecision(typed: String, converted: String,
                         capsOn: Bool = false) -> Decision {
     if exceptions.contains(typed.lowercased()) {
         return Decision(correct: false, reason: "в списке исключений")
+    }
+    // Адреса вроде «192ю168ю2ю1» правим до проверки на «слово целиком»:
+    // словом они не являются, но починить их надо
+    if looksLikeDottedNumber(converted) && !looksLikeDottedNumber(typed) {
+        return Decision(correct: true, reason: "адрес или номер версии")
     }
     // Аббревиатура (HD, СКЗИ): всё заглавными и Caps Lock не был включён
     if !capsOn, typed.rangeOfCharacter(from: .letters) != nil, typed == typed.uppercased() {
