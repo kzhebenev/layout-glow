@@ -191,7 +191,11 @@ func meaningful(_ s: String, lang: String, commands: Set<String> = []) -> Bool {
 // возможен порт. Набранное в русской раскладке выглядит как
 // «192ю168ю2ю1» — словом это никогда не будет, и правило безопасно
 func looksLikeDottedNumber(_ s: String) -> Bool {
-    let body = s.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+    // Хвостовые знаки допустимы: «1.8.6.» в конце предложения — тот же номер
+    var trimmed = s
+    while let last = trimmed.last, !last.isNumber { trimmed.removeLast() }
+    guard !trimmed.isEmpty else { return false }
+    let body = trimmed.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
     guard let address = body.first, !address.isEmpty else { return false }
     if body.count == 2 {
         let port = body[1]

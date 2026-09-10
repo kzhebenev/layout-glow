@@ -34,6 +34,8 @@ final class SmokeTest {
         Scenario(name: "ссылка остаётся латиницей", language: "en",
                  input: "http://vk.com ", expected: "http://vk.com ", doubleShift: false),
         Scenario(name: "адрес IPv4", language: "ru", input: "192ю168ю2ю1 ", expected: "192.168.2.1 ", doubleShift: false),
+        Scenario(name: "номер версии с точкой в конце", language: "ru",
+                 input: "1ю8ю6ю ", expected: "1.8.6. ", doubleShift: false),
         Scenario(name: "знак после слова", language: "en", input: "ghbdtn!", expected: "привет!", doubleShift: false),
         Scenario(name: "запятая границей не считается", language: "en",
                  input: "ghbdtn,", expected: "ghbdtn,", doubleShift: false),

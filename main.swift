@@ -646,10 +646,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func focusChanged() {
         secureFieldCached = isSecureFieldFocused()
-        wordBuffer.removeAll()
-        lastWord = nil
-        pendingUndo = nil
+        // Electron и терминалы шлют уведомления о фокусе пачками прямо
+        // во время печати. Сбрасывать набранное на каждое — значит рвать
+        // слово пополам: так «1ю8ю6ю» превращалось в «ю8ю6ю» и не чинилось
+        let key = focusedFieldKey()
+        if key != lastFieldKey {
+            wordBuffer.removeAll()
+            lastWord = nil
+            pendingUndo = nil
+        }
         if Settings.shared.perFieldLayout { checkFocusedField() }
+        else if let key { lastFieldKey = key }
     }
 
     func enableManualAccessibility(for app: NSRunningApplication) {
@@ -1359,7 +1366,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let target = layout(withID: undo.layoutID)
         let tick = inputTick
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.09) {
-            self.replaceLast(remaining, with: undo.original, switchTo: target, guardTick: tick)
+            self.replaceLast(remaining, with: undo.original, switchTo: target, guardTick: tick,
+                             source: "откат по Backspace")
             self.log("откат по Backspace: «\(undo.word)» возвращено и добавлено в исключения")
             self.showPill(text: "откат", color: .systemGray)
         }
@@ -1392,7 +1400,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         log("двойной Shift: «\(currentSource().map { translate(strokes, via: $0) } ?? "")» -> «\(translate(strokes, via: other))»")
         let text = translate(strokes, via: other) + String(repeating: " ", count: trailing)
-        replaceLast(strokes.count + trailing, with: text, switchTo: other)
+        replaceLast(strokes.count + trailing, with: text, switchTo: other, source: "двойной Shift")
         wordBuffer.removeAll()
         lastWord = strokes
         lastWordTrailing = trailing
@@ -1429,7 +1437,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         log("вставка пресета \(number)")
-        replaceWithText(backspaces: 0, text: text)
+        replaceWithText(backspaces: 0, text: text, source: "пресет \(number)")
     }
 
     func insertSlot(_ number: Int) {
@@ -1438,7 +1446,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         log("вставка из слота \(number)")
-        replaceWithText(backspaces: 0, text: text)
+        replaceWithText(backspaces: 0, text: text, source: "слот \(number)")
     }
 
     // Конвертация выделенного текста. Accessibility отдаёт выделение далеко
@@ -1968,7 +1976,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // успевало их обработать, отсюда «ККОШКА» вместо «КОШКА». Выделение
     // стрелками плюс одна вставка атомарны и от скорости не зависят.
     func replaceLast(_ count: Int, with text: String, switchTo target: TISInputSource?,
-                     guardTick: Int? = nil) {
+                     guardTick: Int? = nil, source: String = "авто") {
         guard ensureAccessibility() else { return }
         guard !replaceInProgress else {
             log("замена: предыдущая ещё идёт, пропуск")
@@ -2016,7 +2024,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if let target { TISSelectInputSource(target) }
                 self.restoreClipboard(saved)
                 self.replaceInProgress = false
-                self.verifyReplacement(expected: text)
+                self.verifyReplacement(expected: text, source: source)
             }
         }
     }
@@ -2042,18 +2050,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // Приложение могло проглотить наши нажатия и промолчать — раньше такие
     // сбои были невидимы и выглядели как «иногда не срабатывает»
-    func verifyReplacement(expected: String) {
+    func verifyReplacement(expected: String, source: String = "авто") {
         guard !expected.isEmpty else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
             guard let actual = self.textBeforeCaret(expected.count) else {
-                self.recordCorrection("«\(expected.trimmingCharacters(in: .whitespaces))» — проверить не удалось")
+                self.recordCorrection("[\(source)] «\(expected.trimmingCharacters(in: .whitespaces))» — проверить не удалось")
                 return
             }
             if actual == expected {
-                self.recordCorrection("«\(expected.trimmingCharacters(in: .whitespaces))» — заменено")
+                self.recordCorrection("[\(source)] «\(expected.trimmingCharacters(in: .whitespaces))» — заменено")
             } else {
                 self.log("замена не подтвердилась: ожидалось «\(expected)», в тексте «\(actual)»")
-                self.recordCorrection("«\(expected.trimmingCharacters(in: .whitespaces))» — НЕ УДАЛОСЬ, в тексте «\(actual)»")
+                self.recordCorrection("[\(source)] «\(expected.trimmingCharacters(in: .whitespaces))» — НЕ УДАЛОСЬ, в тексте «\(actual)»")
                 self.showPill(text: "не удалось", color: .systemRed)
             }
         }
@@ -2077,8 +2085,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pb.setString(saved, forType: .string)
     }
 
-    func replaceWithText(backspaces: Int, text: String) {
-        replaceLast(backspaces, with: text, switchTo: nil)
+    func replaceWithText(backspaces: Int, text: String, source: String = "вставка") {
+        replaceLast(backspaces, with: text, switchTo: nil, source: source)
     }
 
     // MARK: Горячие клавиши слотов (Cmd+Option+1...9)

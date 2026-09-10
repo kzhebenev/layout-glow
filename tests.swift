@@ -113,6 +113,11 @@ check(looksLikeDottedNumber("10.0.0.1:8080"), "адрес: с портом")
 check(!looksLikeDottedNumber("192.168"), "адрес: двух групп мало")
 check(!looksLikeDottedNumber("привет.как.дела"), "адрес: буквы не считаются")
 check(!looksLikeDottedNumber("1.2.3.4567"), "адрес: группа длиннее трёх цифр")
+check(looksLikeDottedNumber("1.8.6."), "адрес: точка в конце не мешает")
+check(looksLikeDottedNumber("192.168.1.1."), "адрес: точка после адреса не мешает")
+check(!looksLikeDottedNumber("..."), "адрес: одни точки не считаются")
+expect(typed: "1ю8ю6ю", converted: "1.8.6.", src: "ru", dst: "en", correct: true)
+expect(typed: "192ю168ю1ю1ю", converted: "192.168.1.1.", src: "ru", dst: "en", correct: true)
 
 // Ссылки, почта и национальные домены
 check(looksTechnical("http://vk.com"), "ссылка со схемой")
