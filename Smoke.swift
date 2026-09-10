@@ -289,7 +289,7 @@ final class SmokeTest {
     // до запускавшего скрипта не доходит
     func say(_ line: String) {
         transcript.append(line)
-        let path = supportDirectory().appendingPathComponent("smoke.log")
+        let path = runtimeDirectory().appendingPathComponent("smoke.log")
         try? transcript.joined(separator: "\n").appending("\n").write(to: path, atomically: true, encoding: .utf8)
         print(line)
     }

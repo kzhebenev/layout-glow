@@ -53,7 +53,7 @@ final class ClipboardHistory: NSObject, NSTableViewDataSource, NSTableViewDelega
     }
 
     private var storageURL: URL {
-        supportDirectory().appendingPathComponent("clipboard.json")
+        runtimeDirectory().appendingPathComponent("clipboard.json")
     }
 
     private func save() {

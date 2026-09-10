@@ -13,7 +13,7 @@ final class PreferencesWindow: NSObject, NSTableViewDataSource, NSTableViewDeleg
     private var hotkeysTable: NSTableView!
     private var presetsTable: NSTableView!
 
-    private var apps: [(bundleID: String, name: String, allowed: Bool, terminal: Bool)] = []
+    private var apps: [(bundleID: String, name: String, mode: String, terminal: Bool)] = []
     private var snippets: [(String, String)] = []
     private var exceptions: [String] = []
     private var hotkeys: [(String, String)] = []
@@ -141,25 +141,28 @@ final class PreferencesWindow: NSObject, NSTableViewDataSource, NSTableViewDeleg
     // MARK: Приложения
 
     private func appsView() -> NSView {
-        appsTable = table(columns: [("app", "Приложение", 320), ("state", "Исправление", 150),
+        appsTable = table(columns: [("app", "Приложение", 300), ("state", "Режим", 170),
                                     ("kind", "Тип", 130)])
         let add = NSButton(title: "Добавить текущее", target: self, action: #selector(addCurrentApp))
-        let toggle = NSButton(title: "Включить или выключить", target: self, action: #selector(toggleSelectedApp))
+        let toggle = NSButton(title: "Сменить режим", target: self, action: #selector(toggleSelectedApp))
         let remove = NSButton(title: "Забыть", target: self, action: #selector(forgetApp))
         return listLayout(table: appsTable, buttons: [add, toggle, remove],
-                          hint: "Терминалы определяются сами; ваш выбор всегда сильнее.")
+                          hint: "Режимы: полностью, вручную (работают только жесты), выключено. "
+                              + "Терминалы по умолчанию получают «вручную»: в оболочке правка портит ввод.")
     }
 
     @objc private func addCurrentApp() {
         guard let bid = delegate.frontApp?.bundleIdentifier else { return }
-        Settings.shared.setExcluded(bid, false)
+        delegate.setMode(.full, for: bid)
         reloadEverything()
     }
 
     @objc private func toggleSelectedApp() {
         let row = appsTable.selectedRow
         guard row >= 0, row < apps.count else { return }
-        Settings.shared.setExcluded(apps[row].bundleID, apps[row].allowed)
+        let bundleID = apps[row].bundleID
+        let current = delegate.mode(forBundleID: bundleID)
+        delegate.setMode(delegate.nextMode(after: current), for: bundleID)
         reloadEverything()
     }
 
@@ -360,7 +363,7 @@ final class PreferencesWindow: NSObject, NSTableViewDataSource, NSTableViewDeleg
         done.runModal()
     }
     @objc private func openStatus() {
-        NSWorkspace.shared.open(supportDirectory().appendingPathComponent("status.log"))
+        NSWorkspace.shared.open(runtimeDirectory().appendingPathComponent("status.log"))
     }
     @objc private func openPermissions() { delegate.showOnboardingFromMenu() }
 
@@ -378,7 +381,7 @@ final class PreferencesWindow: NSObject, NSTableViewDataSource, NSTableViewDeleg
             view.cacheDisplay(in: view.bounds, to: rep)
             guard let data = rep.representation(using: .png, properties: [:]) else { continue }
             let name = "tab-\(index)-\(item.label)".replacingOccurrences(of: " ", with: "-")
-            try? data.write(to: supportDirectory().appendingPathComponent("snapshot-\(name).png"))
+            try? data.write(to: runtimeDirectory().appendingPathComponent("snapshot-\(name).png"))
         }
         if let selected { tabs.selectTabViewItem(selected) }
     }
@@ -518,17 +521,18 @@ final class PreferencesWindow: NSObject, NSTableViewDataSource, NSTableViewDeleg
     private func reloadEverything() {
         let settings = Settings.shared
         var seen = Set<String>()
-        var list: [(String, String, Bool, Bool)] = []
-        for bid in settings.excludedApps.union(settings.allowedApps).sorted() {
+        var list: [(String, String, String, Bool)] = []
+        let known = settings.excludedApps.union(settings.allowedApps).union(settings.appModes.keys)
+        for bid in known.sorted() {
             guard seen.insert(bid).inserted else { continue }
             let running = NSRunningApplication.runningApplications(withBundleIdentifier: bid).first
             list.append((bid, delegate.appName(for: bid),
-                         !settings.excludedApps.contains(bid),
-                         delegate.isTerminalLike(running)))
+                         delegate.mode(forBundleID: bid).rawValue,
+                         delegate.isTerminalLike(bundleID: bid) || delegate.isTerminalLike(running)))
         }
         if let front = delegate.frontApp, let bid = front.bundleIdentifier, seen.insert(bid).inserted {
             list.append((bid, front.localizedName ?? bid,
-                         delegate.correctionAllowed(in: front), delegate.isTerminalLike(front)))
+                         delegate.mode(for: front).rawValue, delegate.isTerminalLike(front)))
         }
         apps = list
         snippets = delegate.snippetsFile.items.sorted { $0.key < $1.key }.map { ($0.key, $0.value) }
@@ -658,7 +662,7 @@ final class PreferencesWindow: NSObject, NSTableViewDataSource, NSTableViewDeleg
             let app = apps[row]
             switch id {
             case "app": return app.name
-            case "state": return app.allowed ? "исправляет" : "выключено"
+            case "state": return app.mode
             default: return app.terminal ? "терминал" : ""
             }
         case snippetsTable:

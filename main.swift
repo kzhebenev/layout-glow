@@ -65,6 +65,7 @@ final class Settings {
             "dryRun": false,
             "clipboardHistory": true,
             "allowedApps": ["com.termius.mac"],
+            "appModes": [String: String](),
             "fieldLayouts": [String: String](),
         ])
     }
@@ -122,6 +123,10 @@ final class Settings {
     var allowedApps: Set<String> {
         get { Set(d.stringArray(forKey: "allowedApps") ?? []) }
         set { d.set(Array(newValue).sorted(), forKey: "allowedApps") }
+    }
+    var appModes: [String: String] {
+        get { d.dictionary(forKey: "appModes") as? [String: String] ?? [:] }
+        set { d.set(newValue, forKey: "appModes") }
     }
     var backspaceUndo: Bool {
         get { d.bool(forKey: "backspaceUndo") }
@@ -329,6 +334,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         loadCorrections()
         clipboard = ClipboardHistory(delegate: self)
         Timer.scheduledTimer(withTimeInterval: 0.8, repeats: true) { [weak self] _ in self?.clipboard?.check() }
+        migrateTerminalModes()
         ensureDefaultHotkeys()
         startTap()
         registerSlotHotkeys()
@@ -649,8 +655,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Electron и терминалы шлют уведомления о фокусе пачками прямо
         // во время печати. Сбрасывать набранное на каждое — значит рвать
         // слово пополам: так «1ю8ю6ю» превращалось в «ю8ю6ю» и не чинилось
+        // В Termius и Electron роль поля то отдаётся, то нет. Считать
+        // это сменой поля нельзя: слово рвётся и не чинится
         let key = focusedFieldKey()
-        if key != lastFieldKey {
+        if let key, !lastFieldKey.isEmpty, key != lastFieldKey {
             wordBuffer.removeAll()
             lastWord = nil
             pendingUndo = nil
@@ -761,7 +769,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // История исправлений: последние строки живут долго, в отличие от
     // сорока событий в status.log, которые вытесняются за минуту
     func recordCorrection(_ line: String) {
-        let path = supportDirectory().appendingPathComponent("corrections.log")
+        let path = runtimeDirectory().appendingPathComponent("corrections.log")
         let stamp = DateFormatter.localizedString(from: Date(), dateStyle: .short, timeStyle: .medium)
         let app = frontApp?.localizedName ?? "?"
         corrections.append("\(stamp)  [\(app)]  \(line)")
@@ -770,7 +778,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func loadCorrections() {
-        let path = supportDirectory().appendingPathComponent("corrections.log")
+        let path = runtimeDirectory().appendingPathComponent("corrections.log")
         guard let text = try? String(contentsOf: path, encoding: .utf8) else { return }
         corrections = text.split(separator: "\n").map(String.init).suffix(500).map { $0 }
     }
@@ -799,7 +807,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // впустую крутил диск и будил систему
         guard text != lastStatusText else { return }
         lastStatusText = text
-        try? text.write(to: supportDirectory().appendingPathComponent("status.log"),
+        try? text.write(to: runtimeDirectory().appendingPathComponent("status.log"),
                         atomically: true, encoding: .utf8)
     }
 
@@ -820,6 +828,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     static let terminalHints = ["term", "console", "shell", "ssh", "putty", "iterm",
                                 "warp", "kitty", "ghostty", "tabby", "alacritty", "hyper"]
 
+    // По идентификатору: работает и для приложений, которые сейчас не запущены
+    func isTerminalLike(bundleID: String) -> Bool {
+        let identity = (bundleID + " " + appName(for: bundleID)).lowercased()
+        return AppDelegate.terminalHints.contains(where: { identity.contains($0) })
+    }
+
     func isTerminalLike(_ app: NSRunningApplication?) -> Bool {
         guard let app else { return false }
         let identity = ((app.bundleIdentifier ?? "") + " " + (app.localizedName ?? "")).lowercased()
@@ -833,14 +847,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             || lowered.contains("console") || lowered.contains("консоль")
     }
 
-    // Работает ли исправление в этом приложении: явный выбор пользователя
-    // сильнее всего, затем список исключений, затем автоопределение терминала
-    func correctionAllowed(in app: NSRunningApplication?) -> Bool {
-        guard let bid = app?.bundleIdentifier else { return true }
-        if Settings.shared.allowedApps.contains(bid) { return true }
-        if Settings.shared.excludedApps.contains(bid) { return false }
-        return !isTerminalLike(app)
+    // Режим приложения: полностью, только вручную (жесты работают,
+    // автоисправление молчит) или выключено. Терминалы по умолчанию
+    // получают «только вручную»: в оболочке слова вроде «b» и «yj» —
+    // это аргументы команд, а не опечатки, и правка там портит ввод
+    enum AppMode: String {
+        case full = "полностью"
+        case manual = "вручную"
+        case off = "выключено"
     }
+
+    func mode(for app: NSRunningApplication?) -> AppMode {
+        guard let bid = app?.bundleIdentifier else { return .full }
+        if let stored = Settings.shared.appModes[bid], let mode = AppMode(rawValue: stored) { return mode }
+        if Settings.shared.allowedApps.contains(bid) { return .full }
+        if Settings.shared.excludedApps.contains(bid) { return .off }
+        return isTerminalLike(app) ? .manual : .full
+    }
+
+    // Режим приложения, которое сейчас не запущено: по сохранённому выбору
+    // и признакам в идентификаторе
+    func mode(forBundleID bid: String) -> AppMode {
+        if let stored = Settings.shared.appModes[bid], let mode = AppMode(rawValue: stored) { return mode }
+        if Settings.shared.allowedApps.contains(bid) { return .full }
+        if Settings.shared.excludedApps.contains(bid) { return .off }
+        return isTerminalLike(bundleID: bid) ? .manual : .full
+    }
+
+    func setMode(_ mode: AppMode, for bundleID: String) {
+        var modes = Settings.shared.appModes
+        modes[bundleID] = mode.rawValue
+        Settings.shared.appModes = modes
+        var excluded = Settings.shared.excludedApps
+        var allowed = Settings.shared.allowedApps
+        excluded.remove(bundleID)
+        allowed.remove(bundleID)
+        Settings.shared.excludedApps = excluded
+        Settings.shared.allowedApps = allowed
+    }
+
+    func nextMode(after mode: AppMode) -> AppMode {
+        switch mode {
+        case .full: return .manual
+        case .manual: return .off
+        case .off: return .full
+        }
+    }
+
+    func correctionAllowed(in app: NSRunningApplication?) -> Bool { mode(for: app) == .full }
+    func manualAllowed(in app: NSRunningApplication?) -> Bool { mode(for: app) != .off }
 
     func isInstalled(_ bundleID: String) -> Bool {
         NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) != nil
@@ -930,9 +985,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         toggle("Только показывать, не менять текст", s.dryRun, #selector(toggleDryRun), icon: "eye")
         if let app = frontApp, let bid = app.bundleIdentifier {
             let name = app.localizedName ?? appName(for: bid)
-            let mark = (isTerminalLike(app) && !s.allowedApps.contains(bid)) ? " (терминал)" : ""
-            toggle("Исправлять в «\(name)»\(mark)", correctionAllowed(in: app),
-                   #selector(toggleFrontApp), icon: "app.badge.checkmark")
+            let current = mode(for: app)
+            let mark = isTerminalLike(app) ? ", терминал" : ""
+            let item = action("«\(name)»: \(current.rawValue)\(mark)", #selector(toggleFrontApp),
+                              icon: "app.badge.checkmark",
+                              tooltip: "Нажмите, чтобы переключить: полностью, вручную, выключено")
+            item.state = current == .full ? .on : (current == .manual ? .mixed : .off)
         }
         let excluded = s.excludedApps.filter { isInstalled($0) }.sorted { appName(for: $0) < appName(for: $1) }
         if !excluded.isEmpty {
@@ -1051,7 +1109,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     @objc func toggleFrontApp() {
         guard let bid = frontApp?.bundleIdentifier else { return }
-        Settings.shared.setExcluded(bid, correctionAllowed(in: frontApp))
+        let next = nextMode(after: mode(for: frontApp))
+        setMode(next, for: bid)
+        showPill(text: next.rawValue, color: .systemGray)
     }
     @objc func removeExcludedApp(_ sender: NSMenuItem) {
         guard let bid = sender.representedObject as? String else { return }
@@ -1063,7 +1123,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func openRules() { NSWorkspace.shared.open(rulesFile.url) }
     @objc func openHotkeys() { NSWorkspace.shared.open(hotkeysFile.url) }
     @objc func openCorrections() {
-        NSWorkspace.shared.open(supportDirectory().appendingPathComponent("corrections.log"))
+        NSWorkspace.shared.open(runtimeDirectory().appendingPathComponent("corrections.log"))
     }
     @objc func reloadDictionaries() {
         exceptionsFile.reload(force: true)
@@ -1296,6 +1356,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         let full = translate(word, via: cur)
+        // В оболочке однобуквенные и двухбуквенные последовательности —
+        // это флаги и аргументы, а не опечатки
+        if isTerminalLike(frontApp), full.count < 4, !looksLikeDottedNumber(translate(word, via: other)) {
+            log("пропуск «\(full)»: в терминале короткие слова не трогаем")
+            return
+        }
         if looksTechnical(full) {
             log("пропуск «\(full)»: ссылка, почта или путь")
             return
@@ -1376,6 +1442,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Ручная конвертация и вставки
 
     func manualConvert() {
+        guard manualAllowed(in: frontApp) else {
+            log("двойной Shift: выключен в «\(frontApp?.localizedName ?? "?")»")
+            return
+        }
         if convertSelection() { log("двойной Shift: конвертирован выделенный текст"); return }
 
         guard let other = otherLayout() else { log("двойной Shift: нет второй раскладки"); return }
@@ -1503,10 +1573,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let saved = clipboardBackup ?? pb.string(forType: .string)
         clipboardBackup = nil
         writeClipboard(text)
+        let slow = isTerminalLike(frontApp)
         DispatchQueue.global(qos: .userInteractive).async {
-            usleep(30000)
+            usleep(slow ? 90000 : 30000)
             self.postKey(9, flags: .maskCommand)  // Cmd+V
-            usleep(260000)
+            usleep(slow ? 400000 : 260000)
             DispatchQueue.main.async {
                 TISSelectInputSource(target)
                 self.restoreClipboard(saved)
@@ -2011,14 +2082,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
             // Стираем именно Backspace: выделение Shift+Влево не работает
             // в терминалах, а туда конвертация нужна не меньше
+            // По SSH эхо приходит с задержкой, и быстрые нажатия
+            // перемешиваются с ответом сервера
+            let slow = DispatchQueue.main.sync { self.isTerminalLike(self.frontApp) }
             if count > 0 {
-                for _ in 0..<count { self.postKey(51) }
-                usleep(50000)
+                for _ in 0..<count {
+                    self.postKey(51)
+                    if slow { usleep(12000) }
+                }
+                usleep(slow ? 160000 : 50000)
             }
             DispatchQueue.main.sync { self.writeClipboard(text) }
-            usleep(30000)
+            usleep(slow ? 90000 : 30000)
             self.postKey(9, flags: .maskCommand)  // Cmd+V
-            usleep(260000)
+            usleep(slow ? 400000 : 260000)
             DispatchQueue.main.async {
                 watchdog.cancel()
                 if let target { TISSelectInputSource(target) }
@@ -2093,6 +2170,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // Файл сочетаний мог быть создан прежней версией: дописываем
     // действия, которых в нём ещё нет, не трогая уже настроенные
+    // Прежние версии разрешали терминалы целиком, и в оболочке правка
+    // портила ввод. Один раз переводим их в режим «вручную»
+    func migrateTerminalModes() {
+        guard !UserDefaults.standard.bool(forKey: "terminalModesMigrated") else { return }
+        UserDefaults.standard.set(true, forKey: "terminalModesMigrated")
+        var modes = Settings.shared.appModes
+        var changed: [String] = []
+        for bid in Settings.shared.allowedApps where isTerminalLike(bundleID: bid) {
+            guard modes[bid] == nil else { continue }
+            modes[bid] = AppMode.manual.rawValue
+            changed.append(appName(for: bid))
+        }
+        guard !changed.isEmpty else { return }
+        Settings.shared.appModes = modes
+        log("терминалы переведены в режим «вручную»: \(changed.joined(separator: ", "))")
+    }
+
     func ensureDefaultHotkeys() {
         let defaults = SnippetFile.parse(defaultHotkeys.joined(separator: "\n"))
         let missing = defaults.filter { hotkeysFile.value(for: $0.key) == nil }
@@ -2253,7 +2347,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let current = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
         log("самопроверка версии \(current)")
         pausedForSmoke = true
-        let report = supportDirectory().appendingPathComponent("smoke.log")
+        let report = runtimeDirectory().appendingPathComponent("smoke.log")
         try? FileManager.default.removeItem(at: report)
 
         let task = Process()
@@ -2359,7 +2453,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             view.cacheDisplay(in: view.bounds, to: rep)
             guard let data = rep.representation(using: .png, properties: [:]) else { continue }
             let name = window.title.isEmpty ? "окно" : window.title.replacingOccurrences(of: " ", with: "-")
-            try? data.write(to: supportDirectory().appendingPathComponent("snapshot-\(name).png"))
+            try? data.write(to: runtimeDirectory().appendingPathComponent("snapshot-\(name).png"))
         }
         preferences?.snapshotAllTabs()
         log("снимки окон сохранены")

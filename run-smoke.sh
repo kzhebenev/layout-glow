@@ -19,7 +19,7 @@ if pgrep -x LayoutGlow >/dev/null; then WAS_RUNNING=1; pkill -x LayoutGlow; slee
 
 # Запуск через open: иначе macOS считает владельцем разрешений терминал,
 # и приложение не сможет ни печатать, ни читать поле
-LOG="$HOME/Library/Application Support/LayoutGlow/smoke.log"
+LOG="$HOME/Library/Application Support/LayoutGlow/smoke/smoke.log"
 rm -f "$LOG"
 EXTRA=""
 [ "${1:-}" = "--in-apps" ] && EXTRA="--in-apps"

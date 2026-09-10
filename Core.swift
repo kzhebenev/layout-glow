@@ -252,6 +252,15 @@ func supportDirectory() -> URL {
     return dir
 }
 
+// Рабочие файлы: журналы, история, буфер. В режиме дымовых тестов
+// уходят в отдельную папку, иначе прогон затирает историю пользователя
+func runtimeDirectory() -> URL {
+    guard CommandLine.arguments.contains("--smoke-test") else { return supportDirectory() }
+    let dir = supportDirectory().appendingPathComponent("smoke")
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir
+}
+
 // Папка в iCloud Drive: словари, общие для всех маков
 func iCloudDirectory() -> URL? {
     let base = FileManager.default.homeDirectoryForCurrentUser
