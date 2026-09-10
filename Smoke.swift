@@ -224,8 +224,15 @@ final class SmokeTest {
         let prepared: [Stroke]? = DispatchQueue.main.sync {
             guard let layout = delegate.source(forLanguage: scenario.language) else { return nil }
             TISSelectInputSource(layout)
+            // Чистим через живой редактор поля: stringValue во время
+            // редактирования не доходит до текста, и сценарии наслаивались
+            window.makeFirstResponder(nil)
             field.stringValue = ""
             window.makeFirstResponder(field)
+            if let editor = window.fieldEditor(false, for: field) as? NSTextView { editor.string = "" }
+            // Активным считаем себя: иначе правила чужого приложения
+            // (например, ручной режим терминала) отменят исправления
+            delegate.frontApp = NSRunningApplication.current
             delegate.wordBuffer.removeAll()
             delegate.lastWord = nil
             delegate.typedAfterBoundary.removeAll()
