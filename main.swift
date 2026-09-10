@@ -250,6 +250,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // прочитать по-новому, иначе «z 'njuj» даёт «я 'nого»
     var typedAfterBoundary: [Stroke] = []
     var correctionTick = 0
+    var tapDisabledCount = 0
+    var currentSourceCache: TISInputSource?
+    var otherSourceCache: TISInputSource?
     var onboardingWindow: NSWindow?
     var shortcutsWindow: NSWindow?
     var onboardingTimer: Timer?
@@ -402,7 +405,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         apply(layout: lastLayout, animated: false)
     }
 
+    func cachedOther() -> TISInputSource? {
+        if let cached = otherSourceCache { return cached }
+        let source = otherLayout()
+        otherSourceCache = source
+        return source
+    }
+
+    func cachedSource() -> TISInputSource? {
+        if let cached = currentSourceCache { return cached }
+        let source = currentSource()
+        currentSourceCache = source
+        return source
+    }
+
     @objc func layoutChanged() {
+        currentSourceCache = nil
+        otherSourceCache = nil
         let now = currentLayout()
         if now != lastLayout { apply(layout: now, animated: true) }
         rememberLayout()
@@ -804,7 +823,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var text = """
         перехват клавиатуры: \(eventTap != nil ? "работает" : "НЕТ (нужен Мониторинг ввода)")
         универсальный доступ: \(AXIsProcessTrusted() ? "выдан" : "НЕ ВЫДАН")
-        нажатий получено: \(keysSeen)
+        нажатий получено: \(keysSeen), перехват отключался: \(tapDisabledCount) раз
         тапов Shift: \(shiftTaps)
         в буфере слова: \(wordBuffer.count) симв.
         AppleFnUsageType: \(fnUsage) (0 = Do Nothing, тап Fn наш)
@@ -1199,7 +1218,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func handleTapEvent(type: CGEventType, event: CGEvent) {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            // Это и есть слепота посреди набора: система выключила перехват,
+            // нажатия мимо нас, а текст уже поехал. Раньше молчали об этом
             if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
+            tapDisabledCount += 1
+            wordBuffer.removeAll()
+            typedAfterBoundary.removeAll()
+            lastWord = nil
+            log("перехват был отключён системой (\(type == .tapDisabledByTimeout ? "не успели" : "ввод пользователя")), включаю заново")
             return
         }
         if event.getIntegerValueField(.eventSourceUserData) == syntheticMagic { return }
@@ -1298,7 +1324,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if replaceInProgress {
             if keycode == 51 {
                 if !typedAfterBoundary.isEmpty { typedAfterBoundary.removeLast() }
-            } else if let cur = currentSource() {
+            } else if let cur = cachedSource() {
                 let stroke = Stroke(keycode: CGKeyCode(keycode), shift: event.flags.contains(.maskShift),
                                     caps: event.flags.contains(.maskAlphaShift))
                 if translate([stroke], via: cur).count == 1 { typedAfterBoundary.append(stroke) }
@@ -1343,14 +1369,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         default:
             let stroke = Stroke(keycode: CGKeyCode(keycode), shift: flags.contains(.maskShift),
                                 caps: flags.contains(.maskAlphaShift))
-            guard let cur = currentSource() else { return }
+            guard let cur = cachedSource() else { return }
             let produced = translate([stroke], via: cur)
             guard let char = produced.first, produced.count == 1 else { return }
             keysSeen += 1
 
             // Знаки вроде запятой заканчивают слово так же, как пробел,
             // но только если в другой раскладке это не буква
-            let otherSource = otherLayout()
+            let otherSource = cachedOther()
             let isBoundary = boundaryChars.contains(char)
                 && (otherSource.map { punctuationInBothLayouts(stroke, cur, $0) } ?? true)
             if isBoundary {

@@ -77,10 +77,23 @@ func layout(withID id: String) -> TISInputSource? {
     enabledLayouts().first(where: { sourceID($0) == id })
 }
 
+// Раскладка меняется редко, а разбирать её нужно на каждое нажатие.
+// Системный вызов тут дорогой: без кэша обработчик перестаёт успевать,
+// macOS отключает перехват, и приложение слепнет посреди набора
+private var layoutDataCache: [String: Data] = [:]
+
+func keyboardLayoutData(for source: TISInputSource) -> Data? {
+    let id = sourceID(source)
+    if let cached = layoutDataCache[id] { return cached }
+    guard let pointer = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) else { return nil }
+    let data = Unmanaged<CFData>.fromOpaque(pointer).takeUnretainedValue() as Data
+    layoutDataCache[id] = data
+    return data
+}
+
 // Что дадут эти клавиши в указанной раскладке
 func translate(_ strokes: [Stroke], via source: TISInputSource) -> String {
-    guard let dataPtr = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) else { return "" }
-    let data = Unmanaged<CFData>.fromOpaque(dataPtr).takeUnretainedValue() as Data
+    guard let data = keyboardLayoutData(for: source) else { return "" }
     return data.withUnsafeBytes { buf -> String in
         guard let layout = buf.bindMemory(to: UCKeyboardLayout.self).baseAddress else { return "" }
         var result = ""
