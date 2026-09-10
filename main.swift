@@ -172,7 +172,7 @@ struct PendingUndo {
 
 let undoWindow = 2.0          // сколько секунд Backspace считается откатом
 let maxLineLength = 400       // столько нажатий помним для конвертации строки
-let terminalPause = 0.35      // в терминале ждём паузу в наборе перед правкой
+let terminalPause = 1.2       // в терминале ждём настоящую паузу, а не микропаузу
 let terminalMinWordLength = 4  // в оболочке «b» и «yj» — аргументы команд, а не опечатки
 let typingGuard = 1.5         // столько секунд после нажатия раскладку не трогаем
 let autoSwitchCooldown = 3.0  // и не переключаем автоматически чаще, чем раз в столько
@@ -2406,22 +2406,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // Файл сочетаний мог быть создан прежней версией: дописываем
     // действия, которых в нём ещё нет, не трогая уже настроенные
-    // Терминал, который пользователь разрешил сам, работает полностью:
-    // предохранители (короткие слова не трогаем, нажатия медленнее)
-    // делают это безопасным. Осторожный режим — только для незнакомых
+    // Автоматическая правка в SSH-сессии не может быть атомарной: пока идёт
+    // замена, приходит эхо сервера и человек продолжает печатать. Проверено
+    // трижды, каждый раз получалась каша. Поэтому терминалы работают
+    // «вручную», а незамеченную вовремя раскладку чинит Cmd+Option+минус:
+    // он конвертирует всё набранное, а не только последнее слово
     func migrateTerminalModes() {
-        guard !UserDefaults.standard.bool(forKey: "terminalModesRestored") else { return }
-        UserDefaults.standard.set(true, forKey: "terminalModesRestored")
+        guard !UserDefaults.standard.bool(forKey: "terminalsManualSince59") else { return }
+        UserDefaults.standard.set(true, forKey: "terminalsManualSince59")
         var modes = Settings.shared.appModes
-        var restored: [String] = []
-        for bid in Settings.shared.allowedApps
-        where isTerminalLike(bundleID: bid) && modes[bid] == AppMode.manual.rawValue {
-            modes.removeValue(forKey: bid)
-            restored.append(appName(for: bid))
+        var changed: [String] = []
+        for bid in Settings.shared.allowedApps.union(modes.keys) where isTerminalLike(bundleID: bid) {
+            guard modes[bid] != AppMode.off.rawValue else { continue }
+            guard modes[bid] != AppMode.manual.rawValue else { continue }
+            modes[bid] = AppMode.manual.rawValue
+            changed.append(appName(for: bid))
         }
-        guard !restored.isEmpty else { return }
+        guard !changed.isEmpty else { return }
         Settings.shared.appModes = modes
-        log("терминалам возвращён полный режим: \(restored.joined(separator: ", "))")
+        log("терминалы переведены в режим «вручную» (правка строки — Cmd+Option+минус): \(changed.joined(separator: ", "))")
     }
 
     func ensureDefaultHotkeys() {
