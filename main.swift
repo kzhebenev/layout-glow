@@ -256,6 +256,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // по собственной памяти о нажатиях
     var lineStrokes: [Stroke] = []
     var correctionTick = 0
+    var undoDeleted = 0           // сколько символов стёрто после исправления
     var tapDisabledCount = 0
     var signatureState = "проверяю"
     var currentSourceCache: TISInputSource?
@@ -1396,11 +1397,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if !lineStrokes.isEmpty { lineStrokes.removeLast() }
             // Сразу после автоисправления Backspace означает «верни как было»
             if Settings.shared.backspaceUndo, let undo = pendingUndo, undoIsFresh(undo) {
+                // Первый Backspace после исправления обычно стирает добавленный
+                // пробел, чтобы продолжить слово: «downloads» + «/». Считать это
+                // отказом от исправления нельзя, поэтому откат — со второго
+                let boundary = undo.corrected.last.map { !$0.isLetter } ?? false
+                if boundary && undoDeleted == 0 {
+                    undoDeleted = 1
+                    correctionTick = inputTick
+            undoDeleted = 0
+                    if !wordBuffer.isEmpty { wordBuffer.removeLast() }
+                    return
+                }
                 pendingUndo = nil
-                undoAutoCorrection(undo)
+                undoAutoCorrection(undo, alreadyDeleted: undoDeleted + 1)
                 return
             }
             pendingUndo = nil
+            undoDeleted = 0
             if wordBuffer.isEmpty { lastWord = nil } else { wordBuffer.removeLast() }
         case 36, 76, 48, 53, 117, 115, 116, 119, 121, 123, 124, 125, 126:
             // Enter, Tab, стрелки, Esc: строка уехала, помнить её больше нельзя
@@ -1523,6 +1536,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                       bundleID: frontApp?.bundleIdentifier,
                                       at: ProcessInfo.processInfo.systemUptime)
             correctionTick = inputTick
+            undoDeleted = 0
             replaceLast(word.count + boundaryText.count, with: replacement,
                         switchTo: other, guardTick: inputTick)
             return
@@ -1541,11 +1555,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Backspace уже съел один символ, поэтому возвращаем остаток.
     // В список исключений слово при этом НЕ попадает: обычное нажатие
     // Backspace слишком легко спутать с намерением «никогда не исправляй»
-    func undoAutoCorrection(_ undo: PendingUndo) {
+    func undoAutoCorrection(_ undo: PendingUndo, alreadyDeleted: Int = 1) {
         wordBuffer.removeAll()
         lastWord = nil
         lastAutoTyped = nil
-        let remaining = max(0, undo.corrected.count - 1)
+        undoDeleted = 0
+        let remaining = max(0, undo.corrected.count - alreadyDeleted)
         let target = layout(withID: undo.layoutID)
         let tick = inputTick
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.09) {

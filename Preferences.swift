@@ -75,7 +75,7 @@ final class PreferencesWindow: NSObject, NSTableViewDataSource, NSTableViewDeleg
              { settings.autoCorrect }, { settings.autoCorrect = $0 }),
             ("Конвертация по двойному Shift", "Выделение или последнее слово",
              { settings.manualConvert }, { settings.manualConvert = $0 }),
-            ("Откат исправления по Backspace", "Осторожно: легко спутать с обычным удалением",
+            ("Откат исправления по Backspace", "Нужно нажать дважды: первый Backspace просто стирает пробел",
              { settings.backspaceUndo }, { settings.backspaceUndo = $0 }),
             ("Только показывать, не менять текст", "Исправления пишутся в журнал, текст не трогается",
              { settings.dryRun }, { settings.dryRun = $0 }),
