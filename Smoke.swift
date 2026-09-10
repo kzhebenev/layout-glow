@@ -48,8 +48,10 @@ final class SmokeTest {
                  input: "lf |ghbdtn ", expected: "да привет ", doubleShift: false),
         // Человек не останавливается на время замены. Раньше наши backspace
         // съедали уже набранное, и «сервер» превращался в «рвер hb»
+        // Хвост тоже читается в новой раскладке: человек печатал русский,
+        // просто раскладка ещё не успела смениться
         Scenario(name: "печать не прекращается во время замены", language: "en",
-                 input: "cthdth hb", expected: "сервер hb", doubleShift: false),
+                 input: "cthdth hb", expected: "сервер ри", doubleShift: false),
     ]
 
     // Расширенный прогон: те же сценарии, но в настоящем приложении.
@@ -221,6 +223,7 @@ final class SmokeTest {
             window.makeFirstResponder(field)
             delegate.wordBuffer.removeAll()
             delegate.lastWord = nil
+            delegate.typedAfterBoundary.removeAll()
             // «|» в сценарии означает паузу: человек не набирает слово
             // за двести миллисекунд, а тесту важно дать исправлению сработать
             return scenario.input.map { character -> Stroke in

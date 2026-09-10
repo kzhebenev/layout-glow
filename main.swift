@@ -245,7 +245,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var pausedForSmoke = false
     var verifyArmed = false
     var pendingUndo: PendingUndo?
-    var typedAfterBoundary = ""   // набранное после границы слова: его нельзя стереть
+    // Нажатия после границы слова. Храним именно нажатия, а не буквы:
+    // если исправление меняет раскладку, эти клавиши тоже нужно
+    // прочитать по-новому, иначе «z 'njuj» даёт «я 'nого»
+    var typedAfterBoundary: [Stroke] = []
     var correctionTick = 0
     var onboardingWindow: NSWindow?
     var shortcutsWindow: NSWindow?
@@ -314,6 +317,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             self.wordBuffer.removeAll()
             self.lastWord = nil
+            self.typedAfterBoundary.removeAll()
         }
 
         Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
@@ -672,6 +676,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             wordBuffer.removeAll()
             lastWord = nil
             pendingUndo = nil
+            typedAfterBoundary.removeAll()
         }
         if Settings.shared.perFieldLayout { checkFocusedField() }
         else if let key { lastFieldKey = key }
@@ -1201,7 +1206,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if pausedForSmoke { return }
 
         if type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown {
-            wordBuffer.removeAll(); lastWord = nil
+            wordBuffer.removeAll(); lastWord = nil; typedAfterBoundary.removeAll()
             return
         }
 
@@ -1296,8 +1301,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             } else if let cur = currentSource() {
                 let stroke = Stroke(keycode: CGKeyCode(keycode), shift: event.flags.contains(.maskShift),
                                     caps: event.flags.contains(.maskAlphaShift))
-                let produced = translate([stroke], via: cur)
-                if produced.count == 1 { typedAfterBoundary += produced }
+                if translate([stroke], via: cur).count == 1 { typedAfterBoundary.append(stroke) }
             }
             return
         }
@@ -1320,7 +1324,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if !word.isEmpty {
                 lastWord = word
                 lastWordTrailing = 1
-                typedAfterBoundary = ""
+                typedAfterBoundary.removeAll()
                 if Settings.shared.autoCorrect { DispatchQueue.main.async { self.autoCorrect(word) } }
             } else if lastWord != nil {
                 lastWordTrailing = min(lastWordTrailing + 1, 4)
@@ -1335,7 +1339,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             pendingUndo = nil
             if wordBuffer.isEmpty { lastWord = nil } else { wordBuffer.removeLast() }
         case 36, 76, 48, 53, 117, 115, 116, 119, 121, 123, 124, 125, 126:
-            wordBuffer.removeAll(); lastWord = nil
+            wordBuffer.removeAll(); lastWord = nil; typedAfterBoundary.removeAll()
         default:
             let stroke = Stroke(keycode: CGKeyCode(keycode), shift: flags.contains(.maskShift),
                                 caps: flags.contains(.maskAlphaShift))
@@ -1355,7 +1359,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if !word.isEmpty {
                     lastWord = word
                     lastWordTrailing = 1
-                    typedAfterBoundary = ""
+                    typedAfterBoundary.removeAll()
                     if Settings.shared.autoCorrect {
                         DispatchQueue.main.async { self.autoCorrect(word, boundary: stroke) }
                     }
@@ -1365,7 +1369,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
             // Копим и здесь: буквы, набранные между пробелом и стартом
             // замены, уже в тексте, и стирать их нельзя
-            typedAfterBoundary += produced
+            typedAfterBoundary.append(stroke)
             wordBuffer.append(stroke)
             if wordBuffer.count > maxWordLen { wordBuffer.removeAll(); lastWord = nil }
         }
@@ -1465,7 +1469,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let target = layout(withID: undo.layoutID)
         let tick = inputTick
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.09) {
-            self.typedAfterBoundary = ""
+            self.typedAfterBoundary.removeAll()
             self.replaceLast(remaining, with: undo.original, switchTo: target, guardTick: tick,
                              source: "откат по Backspace")
             self.log("откат по Backspace: «\(undo.word)» возвращено и добавлено в исключения")
@@ -1504,7 +1508,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         log("двойной Shift: «\(currentSource().map { translate(strokes, via: $0) } ?? "")» -> «\(translate(strokes, via: other))»")
         let text = translate(strokes, via: other) + String(repeating: " ", count: trailing)
-        typedAfterBoundary = ""
+        typedAfterBoundary.removeAll()
         replaceLast(strokes.count + trailing, with: text, switchTo: other, source: "двойной Shift")
         wordBuffer.removeAll()
         lastWord = strokes
@@ -2150,13 +2154,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             // Забираем то, что человек успел набрать после границы слова:
             // эти буквы уже в тексте, и наши backspace их бы съели
-            func takeTyped() -> String {
+            // Хвост читаем в той раскладке, в которую переходим: человек
+            // уже печатал нужный язык, просто раскладка не успела смениться
+            func takeTyped() -> [Stroke] {
                 DispatchQueue.main.sync {
                     let typed = self.typedAfterBoundary
-                    self.typedAfterBoundary = ""
+                    self.typedAfterBoundary.removeAll()
                     return typed
                 }
             }
+            let tailLayout = DispatchQueue.main.sync { target ?? currentSource() }
             // По SSH эхо приходит с задержкой, поэтому в терминалах медленнее
             let slow = DispatchQueue.main.sync { self.isTerminalLike(self.frontApp) }
             func erase(_ amount: Int) {
@@ -2181,7 +2188,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 erase(extra.count)
             }
 
-            DispatchQueue.main.sync { self.writeClipboard(text + tail) }
+            // Разбор раскладки — только с главного потока: системный вызов
+            // проверяет очередь и роняет процесс
+            let tailText: String = DispatchQueue.main.sync {
+                let result = tailLayout.map { translate(tail, via: $0) } ?? ""
+                self.writeClipboard(text + result)
+                return result
+            }
             usleep(slow ? 90000 : 30000)
             self.postKey(9, flags: .maskCommand)  // Cmd+V
             usleep(slow ? 400000 : 260000)
@@ -2190,8 +2203,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if let target { TISSelectInputSource(target) }
                 self.restoreClipboard(saved)
                 self.replaceInProgress = false
-                self.typedAfterBoundary = ""
-                self.verifyReplacement(expected: text + tail, source: source, tick: self.inputTick)
+                self.typedAfterBoundary.removeAll()
+                self.verifyReplacement(expected: text + tailText, source: source, tick: self.inputTick)
             }
         }
     }
@@ -2262,7 +2275,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func replaceWithText(backspaces: Int, text: String, source: String = "вставка") {
         // Здесь набранное слово заменяется целиком, поэтому «хвост»
         // компенсировать нечего: он и есть это слово
-        typedAfterBoundary = ""
+        typedAfterBoundary.removeAll()
         replaceLast(backspaces, with: text, switchTo: nil, source: source)
     }
 
