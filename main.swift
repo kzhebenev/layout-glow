@@ -171,6 +171,7 @@ struct PendingUndo {
 }
 
 let undoWindow = 2.0          // сколько секунд Backspace считается откатом
+let terminalPause = 0.35      // в терминале ждём паузу в наборе перед правкой
 let terminalMinWordLength = 4  // в оболочке «b» и «yj» — аргументы команд, а не опечатки
 let typingGuard = 1.5         // столько секунд после нажатия раскладку не трогаем
 let autoSwitchCooldown = 3.0  // и не переключаем автоматически чаще, чем раз в столько
@@ -1376,7 +1377,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 lastWord = word
                 lastWordTrailing = 1
                 typedAfterBoundary.removeAll()
-                if Settings.shared.autoCorrect { DispatchQueue.main.async { self.autoCorrect(word) } }
+                if Settings.shared.autoCorrect {
+                    let pause = isTerminalLike(frontApp) ? terminalPause : 0
+                    DispatchQueue.main.asyncAfter(deadline: .now() + pause) { self.autoCorrect(word) }
+                }
             } else if lastWord != nil {
                 lastWordTrailing = min(lastWordTrailing + 1, 4)
             }
@@ -1412,7 +1416,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     lastWordTrailing = 1
                     typedAfterBoundary.removeAll()
                     if Settings.shared.autoCorrect {
-                        DispatchQueue.main.async { self.autoCorrect(word, boundary: stroke) }
+                        let pause = isTerminalLike(frontApp) ? terminalPause : 0
+                        DispatchQueue.main.asyncAfter(deadline: .now() + pause) {
+                            self.autoCorrect(word, boundary: stroke)
+                        }
                     }
                 }
                 return
@@ -1435,6 +1442,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if isSecureFieldFocused() {
             log("пропуск: поле для пароля")
             wordBuffer.removeAll(); lastWord = nil
+            return
+        }
+
+        // В терминале замена идёт долго: наши нажатия перемешиваются с эхом
+        // сессии. Поэтому правим только когда человек остановился, а не на ходу
+        if isTerminalLike(frontApp), !typedAfterBoundary.isEmpty {
+            log("пропуск «\(translate(word, via: cur))»: в терминале правим только на паузе")
             return
         }
 
