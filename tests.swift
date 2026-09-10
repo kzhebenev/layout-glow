@@ -119,6 +119,17 @@ check(!looksLikeDottedNumber("..."), "адрес: одни точки не сч�
 expect(typed: "1ю8ю6ю", converted: "1.8.6.", src: "ru", dst: "en", correct: true)
 expect(typed: "192ю168ю1ю1ю", converted: "192.168.1.1.", src: "ru", dst: "en", correct: true)
 
+// Хвост строки, набранный не в той раскладке
+check(wrongLayoutSuffix(typedWords: ["ljrevtyn", "lkz", "Bujhz"],
+                        convertedWords: ["документ", "для", "Игоря"],
+                        srcLang: "en", dstLang: "ru") == 3, "строка: весь текст не в той раскладке")
+check(wrongLayoutSuffix(typedWords: ["git", "commit", "-m", "ntrcn"],
+                        convertedWords: ["пше", "сщььше", "-ь", "текст"],
+                        srcLang: "en", dstLang: "ru", commands: ["git", "commit"]) == 1,
+      "строка: команда уцелела, конвертируется только текст")
+check(wrongLayoutSuffix(typedWords: ["привет", "как"], convertedWords: ["ghbdtn", "rfr"],
+                        srcLang: "ru", dstLang: "en") == 0, "строка: осмысленный текст не трогаем")
+
 // Ссылки, почта и национальные домены
 check(looksTechnical("http://vk.com"), "ссылка со схемой")
 check(looksTechnical("www.google.com"), "ссылка с www")

@@ -13,6 +13,7 @@ final class SmokeTest {
         let input: String
         let expected: String
         let doubleShift: Bool     // конвертировать двойным Shift вместо пробела
+        var convertLine = false   // конвертировать всю строку по хоткею
     }
 
     let delegate: AppDelegate
@@ -48,6 +49,10 @@ final class SmokeTest {
                  input: "lf |ghbdtn ", expected: "да привет ", doubleShift: false),
         // Человек не останавливается на время замены. Раньше наши backspace
         // съедали уже набранное, и «сервер» превращался в «рвер hb»
+        // В терминале строку не выделить и не прочитать, поэтому приложение
+        // конвертирует её по собственной памяти о нажатиях
+        Scenario(name: "конвертация строки по памяти", language: "en",
+                 input: "ppp lll", expected: "ззз ддд", doubleShift: false, convertLine: true),
         // Хвост тоже читается в новой раскладке: человек печатал русский,
         // просто раскладка ещё не успела смениться
         Scenario(name: "печать не прекращается во время замены", language: "en",
@@ -244,6 +249,10 @@ final class SmokeTest {
             usleep(25000)
         }
         if scenario.doubleShift { tapShiftTwice() }
+        if scenario.convertLine {
+            usleep(300000)
+            DispatchQueue.main.sync { self.delegate.convertLine() }
+        }
         usleep(900000)
 
         let actual = DispatchQueue.main.sync { self.currentText() }

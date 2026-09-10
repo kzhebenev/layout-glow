@@ -171,6 +171,7 @@ struct PendingUndo {
 }
 
 let undoWindow = 2.0          // сколько секунд Backspace считается откатом
+let maxLineLength = 400       // столько нажатий помним для конвертации строки
 let terminalPause = 0.35      // в терминале ждём паузу в наборе перед правкой
 let terminalMinWordLength = 4  // в оболочке «b» и «yj» — аргументы команд, а не опечатки
 let typingGuard = 1.5         // столько секунд после нажатия раскладку не трогаем
@@ -250,6 +251,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // если исправление меняет раскладку, эти клавиши тоже нужно
     // прочитать по-новому, иначе «z 'njuj» даёт «я 'nого»
     var typedAfterBoundary: [Stroke] = []
+    // Вся строка с последнего Enter: в терминале ни выделить текст, ни
+    // прочитать его нельзя, поэтому конвертировать строку можно только
+    // по собственной памяти о нажатиях
+    var lineStrokes: [Stroke] = []
     var correctionTick = 0
     var tapDisabledCount = 0
     var signatureState = "проверяю"
@@ -1259,6 +1264,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         if type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown {
             wordBuffer.removeAll(); lastWord = nil; typedAfterBoundary.removeAll()
+            lineStrokes.removeAll()
             return
         }
 
@@ -1370,6 +1376,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         switch keycode {
         case 49:  // пробел — граница слова
+            lineStrokes.append(Stroke(keycode: 49, shift: false, caps: false))
+            if lineStrokes.count > maxLineLength { lineStrokes.removeFirst() }
             pendingUndo = nil
             let word = wordBuffer
             wordBuffer.removeAll()
@@ -1385,6 +1393,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 lastWordTrailing = min(lastWordTrailing + 1, 4)
             }
         case 51:  // backspace
+            if !lineStrokes.isEmpty { lineStrokes.removeLast() }
             // Сразу после автоисправления Backspace означает «верни как было»
             if Settings.shared.backspaceUndo, let undo = pendingUndo, undoIsFresh(undo) {
                 pendingUndo = nil
@@ -1394,7 +1403,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             pendingUndo = nil
             if wordBuffer.isEmpty { lastWord = nil } else { wordBuffer.removeLast() }
         case 36, 76, 48, 53, 117, 115, 116, 119, 121, 123, 124, 125, 126:
+            // Enter, Tab, стрелки, Esc: строка уехала, помнить её больше нельзя
             wordBuffer.removeAll(); lastWord = nil; typedAfterBoundary.removeAll()
+            lineStrokes.removeAll()
         default:
             let stroke = Stroke(keycode: CGKeyCode(keycode), shift: flags.contains(.maskShift),
                                 caps: flags.contains(.maskAlphaShift))
@@ -1409,6 +1420,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let isBoundary = boundaryChars.contains(char)
                 && (otherSource.map { punctuationInBothLayouts(stroke, cur, $0) } ?? true)
             if isBoundary {
+                lineStrokes.append(stroke)
+                if lineStrokes.count > maxLineLength { lineStrokes.removeFirst() }
                 let word = wordBuffer
                 wordBuffer.removeAll()
                 if !word.isEmpty {
@@ -1428,6 +1441,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // Копим и здесь: буквы, набранные между пробелом и стартом
             // замены, уже в тексте, и стирать их нельзя
             typedAfterBoundary.append(stroke)
+            lineStrokes.append(stroke)
+            if lineStrokes.count > maxLineLength { lineStrokes.removeFirst() }
             wordBuffer.append(stroke)
             if wordBuffer.count > maxWordLen { wordBuffer.removeAll(); lastWord = nil }
         }
@@ -1708,7 +1723,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Конвертация текущей строки (Cmd+Option+минус)
 
     func convertLine() {
+        guard manualAllowed(in: frontApp) else { return }
+        // В терминале текст не прочитать и не выделить, зато мы помним,
+        // что человек набрал: стираем столько же и вставляем в другой раскладке
+        if isTerminalLike(frontApp) || !AXIsProcessTrusted() {
+            if convertLineFromMemory() { return }
+        }
         if convertLineViaAccessibility() { return }
+        if convertLineFromMemory() { return }
         // Запасной путь: выделяем строку клавишами и конвертируем как выделение
         guard ensureAccessibility() else { return }
         DispatchQueue.global(qos: .userInteractive).async {
@@ -1723,6 +1745,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
         }
+    }
+
+    func convertLineFromMemory() -> Bool {
+        guard !lineStrokes.isEmpty, let cur = currentSource(), let other = otherLayout() else {
+            log("строка: нечего конвертировать, приложение не помнит ввод")
+            return false
+        }
+        // Режем строку по пробелам и берём только хвост из слов,
+        // набранных не в той раскладке: начало команды должно уцелеть
+        var words: [[Stroke]] = [[]]
+        for stroke in lineStrokes {
+            if stroke.keycode == 49 { words.append([]) } else { words[words.count - 1].append(stroke) }
+        }
+        let typedWords = words.map { translate($0, via: cur) }
+        let convertedWords = words.map { translate($0, via: other) }
+        var suffix = wrongLayoutSuffix(typedWords: typedWords, convertedWords: convertedWords,
+                                       srcLang: sourceLang(cur), dstLang: sourceLang(other),
+                                       commands: commandsFile.words)
+        if suffix == 0 { suffix = words.count }   // человек нажал сам — значит, знает, чего хочет
+
+        let strokes = Array(words.suffix(suffix).joined(separator: [Stroke(keycode: 49, shift: false, caps: false)]))
+        guard !strokes.isEmpty else { return false }
+        let typed = translate(strokes, via: cur)
+        let converted = translate(strokes, via: other)
+        guard converted != typed else { return false }
+        log("строка по памяти: «\(typed)» -> «\(converted)»")
+        typedAfterBoundary.removeAll()
+        replaceLast(strokes.count, with: converted, switchTo: other, source: "строка")
+        // Строка теперь набрана в другой раскладке — помним её именно так
+        wordBuffer.removeAll()
+        lastWord = nil
+        return true
     }
 
     func convertLineViaAccessibility() -> Bool {

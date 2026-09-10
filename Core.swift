@@ -256,6 +256,26 @@ func correctionDecision(typed: String, converted: String,
     return Decision(correct: true, reason: "исправлено")
 }
 
+// Сколько слов с конца набрано не в той раскладке. Нужно, чтобы
+// конвертация строки не портила начало команды: «git commit -m ntrcn»
+// должно превратиться в «git commit -m текст», а не целиком в кириллицу
+func wrongLayoutSuffix(typedWords: [String], convertedWords: [String],
+                       srcLang: String, dstLang: String, commands: Set<String> = []) -> Int {
+    guard typedWords.count == convertedWords.count else { return 0 }
+    var count = 0
+    for index in stride(from: typedWords.count - 1, through: 0, by: -1) {
+        let typed = typedWords[index]
+        let converted = convertedWords[index]
+        if typed.isEmpty { break }
+        // Слово, осмысленное как есть, трогать нельзя: это команда или текст
+        if meaningful(typed, lang: srcLang, commands: commands) { break }
+        // И результат должен быть похож на слово, а не на мусор
+        guard isWordLike(converted) || looksLikeDottedNumber(converted) else { break }
+        count += 1
+    }
+    return count
+}
+
 // MARK: - Файловые словари
 
 func supportDirectory() -> URL {
