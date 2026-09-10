@@ -346,6 +346,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !AXIsProcessTrusted() {
             let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
             AXIsProcessTrustedWithOptions(opts)
+            // Через полминуты без доступа показываем окно с кнопкой ремонта:
+            // молча ждать бесполезно, человек уже поставил галочку
+            DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
+                guard !AXIsProcessTrusted() else { return }
+                self.log("доступ так и не выдан — показываю окно настройки")
+                self.showOnboarding(activate: false)
+            }
         }
         if smokeMode {
             log("режим дымовых тестов")
@@ -1872,6 +1879,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         steps.alignment = .leading
         steps.distribution = .fill
 
+        let repairButton = NSButton(title: "Выдать разрешения заново", target: self,
+                                    action: #selector(repairPermissions))
+        repairButton.bezelStyle = .rounded
+        repairButton.controlSize = .large
+        repairButton.toolTip = "Если галочка стоит, а доступа нет — обычно после обновления"
+
         let shortcutsButton = NSButton(title: "Справка по сочетаниям", target: self, action: #selector(showShortcuts))
         shortcutsButton.bezelStyle = .rounded
         shortcutsButton.controlSize = .large
@@ -1882,7 +1895,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         done.controlSize = .large
         done.bezelColor = .controlAccentColor
 
-        let buttons = NSStackView(views: [shortcutsButton, spacer, done])
+        let buttons = NSStackView(views: [shortcutsButton, repairButton, spacer, done])
         buttons.orientation = .horizontal
         buttons.spacing = 10
 
@@ -2003,6 +2016,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         onboardingTimer = nil
         onboardingWindow?.close()
         onboardingWindow = nil
+    }
+
+    // После смены подписи (например, когда сборка пересоздана с новым
+    // сертификатом) старая запись в списке разрешений уже не относится
+    // к приложению: галочка стоит, доступа нет. Лечится сбросом записи
+    @objc func repairPermissions() {
+        NSApp.activate(ignoringOtherApps: true)
+        let dialog = NSAlert()
+        dialog.messageText = "Выдать разрешения заново?"
+        dialog.informativeText = "Записи в списках «Универсальный доступ» и «Мониторинг ввода» будут сброшены, "
+            + "приложение перезапустится и запросит доступ заново. Это помогает, когда галочка стоит, "
+            + "а доступа нет."
+        dialog.addButton(withTitle: "Сбросить и перезапустить")
+        dialog.addButton(withTitle: "Отмена")
+        guard dialog.runModal() == .alertFirstButtonReturn else { return }
+
+        let bundleID = Bundle.main.bundleIdentifier ?? "ru.devkz.layoutglow"
+        for service in ["Accessibility", "ListenEvent"] {
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+            task.arguments = ["reset", service, bundleID]
+            try? task.run()
+            task.waitUntilExit()
+        }
+        log("разрешения сброшены по просьбе пользователя, перезапуск")
+        relaunch()
+    }
+
+    func relaunch() {
+        let path = Bundle.main.bundlePath
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/bash")
+        task.arguments = ["-c", "sleep 1; open -a \"\(path)\""]
+        try? task.run()
+        NSApp.terminate(nil)
     }
 
     @objc func openKeyboardSettings() {

@@ -342,6 +342,7 @@ final class PreferencesWindow: NSObject, NSTableViewDataSource, NSTableViewDeleg
             button("Очистить историю буфера обмена", #selector(clearClipboard)),
             button("Журнал состояния", #selector(openStatus)),
             button("Разрешения системы", #selector(openPermissions)),
+            button("Выдать разрешения заново", #selector(repairPermissions)),
         ])
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -366,6 +367,7 @@ final class PreferencesWindow: NSObject, NSTableViewDataSource, NSTableViewDeleg
         NSWorkspace.shared.open(runtimeDirectory().appendingPathComponent("status.log"))
     }
     @objc private func openPermissions() { delegate.showOnboardingFromMenu() }
+    @objc private func repairPermissions() { delegate.repairPermissions() }
 
     // Снимок каждой вкладки: смотреть на интерфейс со стороны полезнее,
     // чем верить, что раскладка сложилась правильно
