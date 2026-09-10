@@ -251,6 +251,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var typedAfterBoundary: [Stroke] = []
     var correctionTick = 0
     var tapDisabledCount = 0
+    var signatureState = "проверяю"
     var currentSourceCache: TISInputSource?
     var otherSourceCache: TISInputSource?
     var onboardingWindow: NSWindow?
@@ -342,6 +343,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         loadCorrections()
+        checkSignature()
         clipboard = ClipboardHistory(delegate: self)
         Timer.scheduledTimer(withTimeInterval: 0.8, repeats: true) { [weak self] _ in self?.clipboard?.check() }
         migrateTerminalModes()
@@ -817,11 +819,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         corrections = text.split(separator: "\n").map(String.init).suffix(500).map { $0 }
     }
 
+    // Подпись приложения: если она не проходит проверку, система не свяжет
+    // выданные разрешения с приложением, и они будут выглядеть включёнными
+    func checkSignature() {
+        DispatchQueue.global(qos: .utility).async {
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+            task.arguments = ["--verify", "--strict", Bundle.main.bundlePath]
+            let pipe = Pipe()
+            task.standardError = pipe
+            try? task.run()
+            task.waitUntilExit()
+            let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            DispatchQueue.main.async {
+                self.signatureState = task.terminationStatus == 0
+                    ? "в порядке"
+                    : "повреждена (\(output.trimmingCharacters(in: .whitespacesAndNewlines)))"
+                self.writeStatus()
+            }
+        }
+    }
+
     func writeStatus() {
         let fnUsage = CFPreferencesCopyAppValue("AppleFnUsageType" as CFString,
                                                 "com.apple.HIToolbox" as CFString) as? Int ?? -1
         var text = """
         перехват клавиатуры: \(eventTap != nil ? "работает" : "НЕТ (нужен Мониторинг ввода)")
+        подпись приложения: \(signatureState)
+        расположение: \(Bundle.main.bundlePath)
         универсальный доступ: \(AXIsProcessTrusted() ? "выдан" : "НЕ ВЫДАН")
         нажатий получено: \(keysSeen), перехват отключался: \(tapDisabledCount) раз
         тапов Shift: \(shiftTaps)
@@ -1924,7 +1949,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                      detail: "Чтобы ловить нажатия клавиш и тап Fn", button: "Открыть настройки",
                      action: #selector(openInputMonitoring), tag: 1),
             stepCard(number: 2, title: "Универсальный доступ",
-                     detail: "Чтобы исправлять текст и находить курсор", button: "Открыть настройки",
+                     detail: "Чтобы исправлять текст и находить курсор. "
+                           + "Если ползунок уже включён, а здесь написано «нужно включить» — "
+                           + "нажмите «Выдать разрешения заново»: запись осталась от прежней подписи "
+                           + "и к нынешней сборке не относится",
+                     button: "Открыть настройки",
                      action: #selector(openAccessibility), tag: 2),
             stepCard(number: 3, title: "Клавиша Globe",
                      detail: "«Press Globe key to» поставить в «Do Nothing», иначе тап Fn останется медленным",
