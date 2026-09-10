@@ -171,6 +171,7 @@ struct PendingUndo {
 }
 
 let undoWindow = 2.0          // сколько секунд Backspace считается откатом
+let terminalMinWordLength = 4  // в оболочке «b» и «yj» — аргументы команд, а не опечатки
 let typingGuard = 1.5         // столько секунд после нажатия раскладку не трогаем
 let autoSwitchCooldown = 3.0  // и не переключаем автоматически чаще, чем раз в столько
 
@@ -1358,7 +1359,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let full = translate(word, via: cur)
         // В оболочке однобуквенные и двухбуквенные последовательности —
         // это флаги и аргументы, а не опечатки
-        if isTerminalLike(frontApp), full.count < 4, !looksLikeDottedNumber(translate(word, via: other)) {
+        if isTerminalLike(frontApp), full.count < terminalMinWordLength,
+           !looksLikeDottedNumber(translate(word, via: other)) {
             log("пропуск «\(full)»: в терминале короткие слова не трогаем")
             return
         }
@@ -2170,21 +2172,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // Файл сочетаний мог быть создан прежней версией: дописываем
     // действия, которых в нём ещё нет, не трогая уже настроенные
-    // Прежние версии разрешали терминалы целиком, и в оболочке правка
-    // портила ввод. Один раз переводим их в режим «вручную»
+    // Терминал, который пользователь разрешил сам, работает полностью:
+    // предохранители (короткие слова не трогаем, нажатия медленнее)
+    // делают это безопасным. Осторожный режим — только для незнакомых
     func migrateTerminalModes() {
-        guard !UserDefaults.standard.bool(forKey: "terminalModesMigrated") else { return }
-        UserDefaults.standard.set(true, forKey: "terminalModesMigrated")
+        guard !UserDefaults.standard.bool(forKey: "terminalModesRestored") else { return }
+        UserDefaults.standard.set(true, forKey: "terminalModesRestored")
         var modes = Settings.shared.appModes
-        var changed: [String] = []
-        for bid in Settings.shared.allowedApps where isTerminalLike(bundleID: bid) {
-            guard modes[bid] == nil else { continue }
-            modes[bid] = AppMode.manual.rawValue
-            changed.append(appName(for: bid))
+        var restored: [String] = []
+        for bid in Settings.shared.allowedApps
+        where isTerminalLike(bundleID: bid) && modes[bid] == AppMode.manual.rawValue {
+            modes.removeValue(forKey: bid)
+            restored.append(appName(for: bid))
         }
-        guard !changed.isEmpty else { return }
+        guard !restored.isEmpty else { return }
         Settings.shared.appModes = modes
-        log("терминалы переведены в режим «вручную»: \(changed.joined(separator: ", "))")
+        log("терминалам возвращён полный режим: \(restored.joined(separator: ", "))")
     }
 
     func ensureDefaultHotkeys() {
