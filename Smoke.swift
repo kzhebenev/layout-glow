@@ -46,6 +46,10 @@ final class SmokeTest {
         // слово развалится — так и появлялось «[очу» вместо «хочу»
         Scenario(name: "слово сразу после исправления", language: "en",
                  input: "lf |ghbdtn ", expected: "да привет ", doubleShift: false),
+        // Человек не останавливается на время замены. Раньше наши backspace
+        // съедали уже набранное, и «сервер» превращался в «рвер hb»
+        Scenario(name: "печать не прекращается во время замены", language: "en",
+                 input: "cthdth hb", expected: "сервер hb", doubleShift: false),
     ]
 
     // Расширенный прогон: те же сценарии, но в настоящем приложении.
