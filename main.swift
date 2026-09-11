@@ -172,7 +172,7 @@ struct PendingUndo {
 
 let undoWindow = 2.0          // сколько секунд Backspace считается откатом
 let maxLineLength = 400       // столько нажатий помним для конвертации строки
-let terminalPause = 1.2       // в терминале ждём настоящую паузу, а не микропаузу
+let terminalPause = 0.0       // в терминале не ждём: правим сразу, как везде
 let terminalMinWordLength = 4  // в оболочке «b» и «yj» — аргументы команд, а не опечатки
 let typingGuard = 1.5         // столько секунд после нажатия раскладку не трогаем
 let autoSwitchCooldown = 3.0  // и не переключаем автоматически чаще, чем раз в столько
@@ -928,7 +928,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let stored = Settings.shared.appModes[bid], let mode = AppMode(rawValue: stored) { return mode }
         if Settings.shared.allowedApps.contains(bid) { return .full }
         if Settings.shared.excludedApps.contains(bid) { return .off }
-        return isTerminalLike(app) ? .manual : .full
+        return .full
     }
 
     // Режим приложения, которое сейчас не запущено: по сохранённому выбору
@@ -937,7 +937,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let stored = Settings.shared.appModes[bid], let mode = AppMode(rawValue: stored) { return mode }
         if Settings.shared.allowedApps.contains(bid) { return .full }
         if Settings.shared.excludedApps.contains(bid) { return .off }
-        return isTerminalLike(bundleID: bid) ? .manual : .full
+        return .full
     }
 
     func setMode(_ mode: AppMode, for bundleID: String) {
@@ -1470,13 +1470,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if isSecureFieldFocused() {
             log("пропуск: поле для пароля")
             wordBuffer.removeAll(); lastWord = nil
-            return
-        }
-
-        // В терминале замена идёт долго: наши нажатия перемешиваются с эхом
-        // сессии. Поэтому правим только когда человек остановился, а не на ходу
-        if isTerminalLike(frontApp), !typedAfterBoundary.isEmpty {
-            log("пропуск «\(translate(word, via: cur))»: в терминале правим только на паузе")
             return
         }
 
@@ -2426,20 +2419,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // трижды, каждый раз получалась каша. Поэтому терминалы работают
     // «вручную», а незамеченную вовремя раскладку чинит Cmd+Option+минус:
     // он конвертирует всё набранное, а не только последнее слово
+    // Автоправка в SSH ненадёжна, но без неё работать неудобнее: команды
+    // двуязычные, и одним сочетанием строку не починить. Выбор пользователя —
+    // пусть лучше иногда сбоит, чем молчит
     func migrateTerminalModes() {
-        guard !UserDefaults.standard.bool(forKey: "terminalsManualSince59") else { return }
-        UserDefaults.standard.set(true, forKey: "terminalsManualSince59")
+        guard !UserDefaults.standard.bool(forKey: "terminalsAutoSince62") else { return }
+        UserDefaults.standard.set(true, forKey: "terminalsAutoSince62")
         var modes = Settings.shared.appModes
-        var changed: [String] = []
-        for bid in Settings.shared.allowedApps.union(modes.keys) where isTerminalLike(bundleID: bid) {
-            guard modes[bid] != AppMode.off.rawValue else { continue }
-            guard modes[bid] != AppMode.manual.rawValue else { continue }
-            modes[bid] = AppMode.manual.rawValue
-            changed.append(appName(for: bid))
+        var restored: [String] = []
+        for (bid, mode) in modes where isTerminalLike(bundleID: bid) && mode == AppMode.manual.rawValue {
+            modes.removeValue(forKey: bid)
+            restored.append(appName(for: bid))
         }
-        guard !changed.isEmpty else { return }
+        guard !restored.isEmpty else { return }
         Settings.shared.appModes = modes
-        log("терминалы переведены в режим «вручную» (правка строки — Cmd+Option+минус): \(changed.joined(separator: ", "))")
+        log("терминалам возвращена автоматика: \(restored.joined(separator: ", "))")
     }
 
     func ensureDefaultHotkeys() {

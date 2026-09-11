@@ -23,8 +23,8 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
     <key>CFBundleExecutable</key><string>LayoutGlow</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>6.1</string>
-    <key>CFBundleVersion</key><string>40</string>
+    <key>CFBundleShortVersionString</key><string>6.2</string>
+    <key>CFBundleVersion</key><string>41</string>
     <key>NSHumanReadableCopyright</key><string>© 2026 Константин Жебенев. Лицензия MIT.</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>LSUIElement</key><true/>
