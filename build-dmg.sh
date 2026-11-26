@@ -23,8 +23,8 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
     <key>CFBundleExecutable</key><string>LayoutGlow</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>6.2</string>
-    <key>CFBundleVersion</key><string>41</string>
+    <key>CFBundleShortVersionString</key><string>6.3</string>
+    <key>CFBundleVersion</key><string>42</string>
     <key>NSHumanReadableCopyright</key><string>© 2026 Константин Жебенев. Лицензия MIT.</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>LSUIElement</key><true/>
@@ -47,7 +47,7 @@ CN="LayoutGlow Self-Signed"
 if [ ! -f "$KEYCHAIN" ] && [ -x "$DIR/setup-signing.sh" ]; then
     "$DIR/setup-signing.sh"
 fi
-if security find-identity -v -p codesigning "$KEYCHAIN" 2>/dev/null | grep -q "$CN"; then
+if security find-identity -p codesigning "$KEYCHAIN" 2>/dev/null | grep -q "$CN"; then
     PASSFILE="$HOME/Library/Application Support/LayoutGlow/signing.pass"
     PASS=""
     [ -f "$PASSFILE" ] && PASS="$(cat "$PASSFILE")"
@@ -58,7 +58,10 @@ if security find-identity -v -p codesigning "$KEYCHAIN" 2>/dev/null | grep -q "$
         PASS="$(cat "$PASSFILE" 2>/dev/null)"
         security unlock-keychain -p "$PASS" "$KEYCHAIN" 2>/dev/null || true
     fi
-    codesign --force --keychain "$KEYCHAIN" -s "$CN" "$APP"
+    # По отпечатку, а не по имени: так подпись не зависит от того, считает ли
+    # система сертификат доверенным
+    IDENTITY="$(security find-identity -p codesigning "$KEYCHAIN" | awk -v cn="$CN" 'index($0, cn) {print $2; exit}')"
+    codesign --force --keychain "$KEYCHAIN" -s "$IDENTITY" "$APP"
 else
     echo "Внимание: подписываю ad-hoc — разрешения придётся выдавать заново после каждой пересборки."
     codesign --force -s - "$APP"

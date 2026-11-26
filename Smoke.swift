@@ -57,6 +57,13 @@ final class SmokeTest {
         // просто раскладка ещё не успела смениться
         Scenario(name: "печать не прекращается во время замены", language: "en",
                  input: "cthdth hb", expected: "сервер ри", doubleShift: false),
+        // Нажатия на время замены придерживаются и доигрываются после неё.
+        // Раньше первые буквы следующего слова выпадали из буфера, и от
+        // «как» оставалось «ак», которое чинилось в «fr»: выходило «кfr»
+        Scenario(name: "следующее слово после замены остаётся целым", language: "en",
+                 input: "cthdth rfr ", expected: "сервер как ", doubleShift: false),
+        Scenario(name: "три слова подряд без пауз", language: "en",
+                 input: "ghbdtn vbh lheuj ", expected: "привет мир друго ", doubleShift: false),
     ]
 
     // Расширенный прогон: те же сценарии, но в настоящем приложении.

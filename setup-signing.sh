@@ -22,7 +22,9 @@ if [ ! -f "$PASSFILE" ]; then
     fi
 fi
 
-if security find-identity -v -p codesigning "$KEYCHAIN" 2>/dev/null | grep -q "$CN"; then
+# Без ключа -v: самоподписанный сертификат без записи о доверии в список
+# «действительных» не попадает, хотя подписывать им можно
+if security find-identity -p codesigning "$KEYCHAIN" 2>/dev/null | grep -q "$CN"; then
     if [ -f "$PASSFILE" ] && security unlock-keychain -p "$(cat "$PASSFILE")" "$KEYCHAIN" 2>/dev/null; then
         echo "Сертификат «$CN» уже есть."
         exit 0
@@ -73,8 +75,9 @@ case "$CURRENT" in
     *) security list-keychains -d user -s $CURRENT "$KEYCHAIN" ;;
 esac
 
-# Доверие для подписи кода (пользовательский домен, без пароля админа)
-security add-trusted-cert -r trustRoot -p codeSign -k "$KEYCHAIN" "$TMP/cert.pem" 2>/dev/null \
-    || echo "Предупреждение: не удалось выставить доверие, подпись может не пройти."
+# Запись о доверии (security add-trusted-cert) здесь не ставится: она
+# требует пароль в системном окне и подвешивает сборку без человека, а для
+# подписи и для разрешений macOS не нужна. Разрешения привязаны к отпечатку
+# сертификата, а не к доверию ему
 
 echo "Сертификат «$CN» создан."

@@ -9,6 +9,82 @@ struct Stroke {
     let caps: Bool
 }
 
+// MARK: - Удержание ввода на время замены
+
+// Замена слова занимает до полусекунды: стереть, вставить, дождаться
+// приложения. Раньше нажатия в это время шли в текст как есть — в старой
+// раскладке и куда придётся: перед вставкой («lдолго»), после неё
+// («долго lb») или терялись из буфера слова, и следующее слово чинилось
+// наполовину («кfr» вместо «как»). Теперь перехват на это время забирает
+// нажатия себе и отдаёт их приложению после замены, уже в новой раскладке.
+// Класс живёт на двух потоках (перехват и главный), поэтому всё под замком.
+struct HeldKey: Equatable {
+    let keycode: Int64
+    let flags: UInt64
+    let down: Bool
+    let autorepeat: Bool
+}
+
+final class InputGate {
+    private let lock = NSLock()
+    private var holding = false
+    private var held: [HeldKey] = []
+    private var heldDown = Set<Int64>()
+    private var deadline: TimeInterval = 0
+    private var heldTotal = 0
+
+    var isHolding: Bool { lock.lock(); defer { lock.unlock() }; return holding }
+    var heldCount: Int { lock.lock(); defer { lock.unlock() }; return heldTotal }
+
+    // Начать удержание. Срок — страховка: если замена зависла, перехват
+    // сам заметит просрочку и попросит отдать накопленное
+    func begin(now: TimeInterval, limit: TimeInterval) {
+        lock.lock()
+        holding = true
+        deadline = now + limit
+        lock.unlock()
+    }
+
+    enum Verdict { case pass, hold, holdExpired }
+
+    // Решение по нажатию. `passed` вызывается под замком для пропущенных
+    // нажатий: так порядок «пропущено до начала удержания» сохраняется
+    // и для того, кто их потом разбирает
+    func offer(_ key: HeldKey, now: TimeInterval, passed: () -> Void = {}) -> Verdict {
+        lock.lock()
+        defer { lock.unlock() }
+        guard holding else { passed(); return .pass }
+        // Отпускание клавиши, нажатой до удержания, приложение должно увидеть
+        if !key.down && !heldDown.contains(key.keycode) { return .pass }
+        if key.down { heldDown.insert(key.keycode) } else { heldDown.remove(key.keycode) }
+        held.append(key)
+        heldTotal += 1
+        return now > deadline ? .holdExpired : .hold
+    }
+
+    // Забрать накопленное. Пусто — удержание снимается в том же замке,
+    // поэтому между «забрал последнее» и «отпустил» ничего не проскочит
+    func takeOrRelease() -> [HeldKey] {
+        lock.lock()
+        defer { lock.unlock() }
+        if held.isEmpty {
+            holding = false
+            heldDown.removeAll()
+            return []
+        }
+        let batch = held
+        held.removeAll()
+        return batch
+    }
+}
+
+// Что из набранного во время замены считать началом следующего слова:
+// всё после последнего пробела
+func strokesAfterLastSpace(_ strokes: [Stroke]) -> [Stroke] {
+    guard let index = strokes.lastIndex(where: { $0.keycode == 49 }) else { return strokes }
+    return Array(strokes[(index + 1)...])
+}
+
 // Дефис и апостроф внутри слова допустимы: «дабл-шифт» разбирается по частям
 let wordSeparators: Set<Character> = ["-", "'", "\u{2019}"]
 

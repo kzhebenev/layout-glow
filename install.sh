@@ -8,7 +8,8 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # Убираем старую установку через LaunchAgent, если была
 launchctl bootout "gui/$UID/ru.devkz.layoutglow" 2>/dev/null || true
 rm -f "$HOME/Library/LaunchAgents/ru.devkz.layoutglow.plist"
-rm -rf "$HOME/Library/Application Support/LayoutGlow"
+# Папку со словарями, журналами и паролем подписи не трогаем: раньше она
+# стиралась здесь целиком, и переустановка уносила исключения и историю
 pkill -x LayoutGlow 2>/dev/null || true
 sleep 0.3
 

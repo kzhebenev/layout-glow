@@ -33,6 +33,9 @@ let lineKeycode: UInt32 = 27     // Cmd+Option+минус — конвертир
 let slotKeycodes: Set<Int64> = [29, 18, 19, 20, 21, 23, 22, 26, 28, 25, 27]  // цифры и минус
 let maxWordLen = 32
 let syntheticMagic: Int64 = 0x4C474C4F  // метка наших синтетических событий
+let replayMagic: Int64 = 0x4C475250     // метка нажатий человека, придержанных на время замены
+let holdLimit = 2.5              // дольше этого нажатия не держим ни при каких условиях
+let manualSwitchGuard = 3.0      // столько секунд после ручного выбора раскладки автоматика молчит
 let releasesAPI = "https://api.github.com/repos/kzhebenev/layout-glow/releases/latest"
 let releasesPage = "https://github.com/kzhebenev/layout-glow/releases/latest"
 
@@ -172,7 +175,6 @@ struct PendingUndo {
 
 let undoWindow = 2.0          // сколько секунд Backspace считается откатом
 let maxLineLength = 400       // столько нажатий помним для конвертации строки
-let terminalPause = 0.0       // в терминале не ждём: правим сразу, как везде
 let terminalMinWordLength = 4  // в оболочке «b» и «yj» — аргументы команд, а не опечатки
 let typingGuard = 1.5         // столько секунд после нажатия раскладку не трогаем
 let autoSwitchCooldown = 3.0  // и не переключаем автоматически чаще, чем раз в столько
@@ -199,6 +201,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem?
 
     var eventTap: CFMachPort?
+    var tapRunLoop: CFRunLoop?
+    var tapIsActive = false       // перехват умеет задерживать нажатия (нужен Универсальный доступ)
+    let gate = InputGate()
+    let gateQueue = DispatchQueue(label: "ru.devkz.layoutglow.gate", qos: .userInteractive)
+    var replaceAborted = false
+    var tailBackspaces = 0
+    var lastManualSwitchAt: TimeInterval = 0
+    var lastManualSwitchApp: String?
+    var lastKeyEventAt: TimeInterval = 0   // время последнего нажатия по часам самого события
+    var activeTapUnavailable = false
+    var tapFoundDisabled = false
+    var switchLog: [String] = []
+    var secureOwner: String?
+    var lastSwitchNote = "—"
     var fnDown = false
     var fnUsedAsModifier = false
     var fnDownAt: TimeInterval = 0
@@ -349,7 +365,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
+        // После сна и смены пользователя перехват иногда остаётся «включённым»,
+        // но нажатий больше не получает. Пересоздать его дешевле, чем гадать
+        for name in [NSWorkspace.didWakeNotification, NSWorkspace.sessionDidBecomeActiveNotification] {
+            NSWorkspace.shared.notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                guard let self, self.eventTap != nil else { return }
+                self.restartTap(name == NSWorkspace.didWakeNotification ? "после сна" : "после возврата в сеанс")
+            }
+        }
+
         loadCorrections()
+        loadSwitchLog()
         checkSignature()
         clipboard = ClipboardHistory(delegate: self)
         Timer.scheduledTimer(withTimeInterval: 0.8, repeats: true) { [weak self] _ in self?.clipboard?.check() }
@@ -358,7 +384,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         startTap()
         registerSlotHotkeys()
         AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.4)
-        Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.writeStatus() }
+        Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            self?.checkTapHealth()
+            self?.writeStatus()
+        }
         writeStatus()
 
         if !AXIsProcessTrusted() {
@@ -752,6 +781,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func select(_ source: TISInputSource, why: String) {
         guard sourceID(source) != currentLayoutFullID() else { return }
         let now = ProcessInfo.processInfo.systemUptime
+        // Человек только что выбрал раскладку сам (Fn или меню). Если в эту
+        // секунду сменится роль поля, автоматика вернула бы старую, и это
+        // выглядело бы как «Fn не переключает»
+        // Только пока человек в том же приложении: перешёл в другое —
+        // пусть оно получает свою раскладку как обычно
+        if now - lastManualSwitchAt < manualSwitchGuard,
+           lastManualSwitchApp == frontApp?.bundleIdentifier {
+            noteSwitch("авто «\(why)» отменено: раскладку только что выбрали вручную")
+            rememberFieldLayout()
+            return
+        }
         if now - lastInputAt < typingGuard || !wordBuffer.isEmpty {
             log("\(why): отложено, идёт набор")
             rememberFieldLayout()   // подстраиваемся под то, что человек печатает сейчас
@@ -764,7 +804,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         lastAutoSwitchAt = now
         restoringLayout = true
         TISSelectInputSource(source)
-        log(why)
+        currentSourceCache = nil
+        otherSourceCache = nil
+        noteSwitch("авто: \(why)")
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.restoringLayout = false }
     }
 
@@ -820,6 +862,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         try? corrections.joined(separator: "\n").appending("\n").write(to: path, atomically: true, encoding: .utf8)
     }
 
+    // Журнал переключений раскладки: каждое нажатие Fn с исходом и причиной,
+    // автоматические переключения, отключения перехвата, защищённый ввод.
+    // Сорок событий status.log живут минуту, а «Fn не сработал» вспоминают позже
+    func noteSwitch(_ line: String) {
+        let stamp = DateFormatter.localizedString(from: Date(), dateStyle: .short, timeStyle: .medium)
+        lastSwitchNote = "\(stamp)  \(line)"
+        switchLog.append("\(stamp)  [\(frontApp?.localizedName ?? "?")]  \(line)")
+        if switchLog.count > 300 { switchLog.removeFirst(switchLog.count - 300) }
+        try? switchLog.joined(separator: "\n").appending("\n")
+            .write(to: runtimeDirectory().appendingPathComponent("switch.log"), atomically: true, encoding: .utf8)
+        log(line)
+    }
+
+    func loadSwitchLog() {
+        let path = runtimeDirectory().appendingPathComponent("switch.log")
+        guard let text = try? String(contentsOf: path, encoding: .utf8) else { return }
+        switchLog = text.split(separator: "\n").map(String.init).suffix(300).map { $0 }
+    }
+
+    // Кто держит защищённый ввод. Пока он включён (поле пароля, а иногда
+    // и приложение, забывшее его выключить), система не отдаёт нажатия никому
+    func secureInputOwner() -> String? {
+        guard IsSecureEventInputEnabled() else { return nil }
+        guard let session = CGSessionCopyCurrentDictionary() as? [String: Any],
+              let pid = session["kCGSSessionSecureInputPID"] as? Int, pid > 0 else { return "неизвестное приложение" }
+        return NSRunningApplication(processIdentifier: pid_t(pid))?.localizedName ?? "процесс \(pid)"
+    }
+
+    func checkTapHealth() {
+        let owner = secureInputOwner()
+        if owner != secureOwner {
+            secureOwner = owner
+            noteSwitch(owner.map { "защищённый ввод включён: «\($0)», нажатия системой не отдаются" }
+                       ?? "защищённый ввод выключен")
+        }
+        guard let tap = eventTap else { return }
+        if !CGEvent.tapIsEnabled(tap: tap) {
+            CGEvent.tapEnable(tap: tap, enable: true)
+            resetKeyState()
+            // Без разрешений перехват не включается вовсе: пишем один раз,
+            // а не каждые пять секунд
+            if !tapFoundDisabled {
+                tapFoundDisabled = true
+                tapDisabledCount += 1
+                noteSwitch("перехват оказался выключен, включаю заново")
+            }
+        } else if tapFoundDisabled {
+            tapFoundDisabled = false
+            noteSwitch("перехват снова работает")
+        }
+        // Доступ выдали уже после запуска: пересоздаём перехват, чтобы он
+        // мог придерживать нажатия на время замены
+        if !AXIsProcessTrusted() { activeTapUnavailable = false }
+        if !tapIsActive && AXIsProcessTrusted() && !activeTapUnavailable {
+            restartTap("появился Универсальный доступ")
+        }
+    }
+
     func loadCorrections() {
         let path = runtimeDirectory().appendingPathComponent("corrections.log")
         guard let text = try? String(contentsOf: path, encoding: .utf8) else { return }
@@ -851,7 +951,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let fnUsage = CFPreferencesCopyAppValue("AppleFnUsageType" as CFString,
                                                 "com.apple.HIToolbox" as CFString) as? Int ?? -1
         var text = """
-        перехват клавиатуры: \(eventTap != nil ? "работает" : "НЕТ (нужен Мониторинг ввода)")
+        перехват клавиатуры: \(eventTap == nil ? "НЕТ (нужен Мониторинг ввода)" : (tapIsActive ? "работает, нажатия на время замены придерживаются" : "работает только на чтение (нужен Универсальный доступ)"))
+        защищённый ввод: \(secureOwner.map { "ВКЛЮЧЁН, держит «\($0)»" } ?? "выключен")
+        последнее переключение: \(lastSwitchNote)
+        придержано нажатий за всё время: \(gate.heldCount)
         подпись приложения: \(signatureState)
         расположение: \(Bundle.main.bundlePath)
         универсальный доступ: \(AXIsProcessTrusted() ? "выдан" : "НЕ ВЫДАН")
@@ -1039,6 +1142,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(state)
         menu.addItem(.separator())
 
+        header("Раскладка")
+        let currentID = currentLayoutFullID()
+        for source in enabledLayouts() {
+            let item = action(sourceName(source), #selector(selectLayoutItem(_:)), icon: "keyboard",
+                              tooltip: "Переключить на эту раскладку")
+            item.representedObject = sourceID(source)
+            item.state = sourceID(source) == currentID ? .on : .off
+        }
+        if let owner = secureInputOwner() {
+            let text = "Защищённый ввод: «\(owner)». Пока он включён, Fn и исправление не работают"
+            let warn = action(text, #selector(openSwitchLog), icon: "lock",
+                              tooltip: "Система не отдаёт нажатия, пока приложение держит защищённый ввод. Обычно помогает закрыть поле пароля или это приложение")
+            warn.attributedTitle = NSAttributedString(string: text, attributes: [
+                .font: NSFont.systemFont(ofSize: 13, weight: .medium), .foregroundColor: NSColor.systemOrange])
+        }
+        _ = action("Перезапустить перехват клавиатуры", #selector(restartTapFromMenu), icon: "arrow.clockwise",
+                   tooltip: "Если Fn или автоисправление перестали срабатывать")
+        _ = action("Журнал переключений", #selector(openSwitchLog), icon: "list.bullet.rectangle",
+                   tooltip: "Каждое нажатие Fn с исходом и причиной: \(lastSwitchNote)")
+
         header("Переключение")
         toggle("Быстрый тап Fn", s.fnSwitch, #selector(toggleFn), icon: "bolt")
         toggle("Своя раскладка для приложений", s.perAppLayout, #selector(togglePerApp), icon: "square.grid.2x2")
@@ -1221,20 +1344,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Перехват клавиатуры
 
+    // Перехват живёт на своём потоке: он активный (умеет задерживать нажатия),
+    // и любая заминка главного потока иначе тормозила бы клавиатуру всей системы.
+    // Обработчик делает минимум — решает «пропустить или придержать» и
+    // передаёт сведения о нажатии главному потоку
     func startTap() {
+        guard eventTap == nil else { return }
         let mask: CGEventMask = (1 << CGEventType.flagsChanged.rawValue) | (1 << CGEventType.keyDown.rawValue)
+            | (1 << CGEventType.keyUp.rawValue)
             | (1 << CGEventType.leftMouseDown.rawValue) | (1 << CGEventType.rightMouseDown.rawValue)
             | (1 << CGEventType.otherMouseDown.rawValue)
         let callback: CGEventTapCallBack = { _, type, event, refcon in
             let me = Unmanaged<AppDelegate>.fromOpaque(refcon!).takeUnretainedValue()
-            me.handleTapEvent(type: type, event: event)
-            return Unmanaged.passUnretained(event)
+            return me.tapCallback(type: type, event: event) ? Unmanaged.passUnretained(event) : nil
         }
-        guard let tap = CGEvent.tapCreate(
-            tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly,
-            eventsOfInterest: mask, callback: callback,
-            userInfo: Unmanaged.passUnretained(self).toOpaque())
-        else {
+        func create(_ options: CGEventTapOptions) -> CFMachPort? {
+            CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: options,
+                              eventsOfInterest: mask, callback: callback,
+                              userInfo: Unmanaged.passUnretained(self).toOpaque())
+        }
+        // Активный перехват система даёт только с Универсальным доступом;
+        // без него остаёмся на чтении, как раньше
+        var active = false
+        var created: CFMachPort?
+        if AXIsProcessTrusted(), let tap = create(.defaultTap) {
+            created = tap
+            active = true
+            activeTapUnavailable = false
+        } else {
+            // Доступ есть, а активный перехват не дали: запоминаем, чтобы
+            // сторож не пересоздавал перехват каждые пять секунд
+            activeTapUnavailable = AXIsProcessTrusted()
+            created = create(.listenOnly)
+        }
+        guard let tap = created else {
             if !accessRequested {
                 accessRequested = true
                 IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
@@ -1243,25 +1386,136 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         eventTap = tap
-        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
-        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
-        CGEvent.tapEnable(tap: tap, enable: true)
+        tapIsActive = active
+        let ready = DispatchSemaphore(value: 0)
+        var loop: CFRunLoop?
+        let thread = Thread {
+            loop = CFRunLoopGetCurrent()
+            let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+            CFRunLoopAddSource(loop, source, .commonModes)
+            CGEvent.tapEnable(tap: tap, enable: true)
+            ready.signal()
+            CFRunLoopRun()
+        }
+        thread.name = "LayoutGlow keyboard tap"
+        thread.qualityOfService = .userInteractive
+        thread.start()
+        _ = ready.wait(timeout: .now() + 2)
+        tapRunLoop = loop
     }
 
-    func handleTapEvent(type: CGEventType, event: CGEvent) {
+    func stopTap() {
+        guard let tap = eventTap else { return }
+        CGEvent.tapEnable(tap: tap, enable: false)
+        CFMachPortInvalidate(tap)
+        if let loop = tapRunLoop { CFRunLoopStop(loop) }
+        eventTap = nil
+        tapRunLoop = nil
+        tapIsActive = false
+    }
+
+    func resetKeyState() {
+        fnDown = false
+        fnUsedAsModifier = false
+        shiftDown = false
+        shiftUsedAsModifier = false
+        lastShiftTapAt = 0
+        wordBuffer.removeAll()
+        typedAfterBoundary.removeAll()
+        lastWord = nil
+    }
+
+    func restartTap(_ reason: String) {
+        stopTap()
+        resetKeyState()
+        replaceInProgress = false
+        drainHeld()
+        startTap()
+        noteSwitch("перехват перезапущен: \(reason)")
+    }
+
+    @objc func restartTapFromMenu() {
+        restartTap("вручную")
+        showPill(text: eventTap != nil ? "перехват перезапущен" : "нет доступа", color: eventTap != nil ? .systemGreen : .systemRed)
+    }
+
+    struct TapInfo {
+        let type: CGEventType
+        let keycode: Int64
+        let flags: CGEventFlags
+        let timestamp: UInt64
+    }
+
+    // Поток перехвата. Возвращает false, если нажатие придержано
+    func tapCallback(type: CGEventType, event: CGEvent) -> Bool {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            // Это и есть слепота посреди набора: система выключила перехват,
-            // нажатия мимо нас, а текст уже поехал. Раньше молчали об этом
             if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
-            tapDisabledCount += 1
-            wordBuffer.removeAll()
-            typedAfterBoundary.removeAll()
-            lastWord = nil
-            log("перехват был отключён системой (\(type == .tapDisabledByTimeout ? "не успели" : "ввод пользователя")), включаю заново")
-            return
+            drainHeld()
+            let timeout = type == .tapDisabledByTimeout
+            DispatchQueue.main.async { self.tapWasDisabled(timeout: timeout) }
+            return true
         }
-        if event.getIntegerValueField(.eventSourceUserData) == syntheticMagic { return }
+        let userData = event.getIntegerValueField(.eventSourceUserData)
+        if userData == syntheticMagic { return true }
+        let info = TapInfo(type: type, keycode: event.getIntegerValueField(.keyboardEventKeycode),
+                           flags: event.flags, timestamp: event.timestamp)
+        guard type == .keyDown || type == .keyUp else {
+            DispatchQueue.main.async { self.handleTapEvent(info) }
+            return true
+        }
+        // Придержанное нажатие, которое мы сами возвращаем приложению:
+        // для разбора слов это обычное нажатие человека
+        if userData == replayMagic {
+            if type == .keyDown { DispatchQueue.main.async { self.handleTapEvent(info) } }
+            return true
+        }
+        let key = HeldKey(keycode: info.keycode, flags: info.flags.rawValue, down: type == .keyDown,
+                          autorepeat: event.getIntegerValueField(.keyboardEventAutorepeat) != 0)
+        let verdict = gate.offer(key, now: ProcessInfo.processInfo.systemUptime) {
+            if type == .keyDown { DispatchQueue.main.async { self.handleTapEvent(info) } }
+        }
+        switch verdict {
+        case .pass: return true
+        case .hold: return false
+        case .holdExpired:
+            drainHeld()
+            return false
+        }
+    }
+
+    // Возвращаем приложению придержанные нажатия в том же порядке. Событие
+    // создаётся заново из кода клавиши, поэтому буква получится в той
+    // раскладке, которая стоит сейчас, то есть уже в исправленной.
+    // Пока очередь не пуста, новые нажатия встают в её конец
+    func drainHeld() {
+        gateQueue.async {
+            while true {
+                let batch = self.gate.takeOrRelease()
+                if batch.isEmpty { return }
+                for key in batch {
+                    guard let e = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(key.keycode),
+                                          keyDown: key.down) else { continue }
+                    e.flags = CGEventFlags(rawValue: key.flags)
+                    if key.autorepeat { e.setIntegerValueField(.keyboardEventAutorepeat, value: 1) }
+                    e.setIntegerValueField(.eventSourceUserData, value: replayMagic)
+                    e.post(tap: .cgSessionEventTap)
+                    usleep(1500)
+                }
+            }
+        }
+    }
+
+    func tapWasDisabled(timeout: Bool) {
+        // Это и есть слепота посреди набора: система выключила перехват,
+        // нажатия мимо нас, а текст уже поехал
+        tapDisabledCount += 1
+        resetKeyState()
+        noteSwitch("перехват был отключён системой (\(timeout ? "не успели" : "ввод пользователя")), включён заново")
+    }
+
+    func handleTapEvent(_ info: TapInfo) {
         if pausedForSmoke { return }
+        let type = info.type
 
         if type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown {
             wordBuffer.removeAll(); lastWord = nil; typedAfterBoundary.removeAll()
@@ -1269,12 +1523,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        let keycode = event.getIntegerValueField(.keyboardEventKeycode)
+        let keycode = info.keycode
         if type == .keyDown {
             inputTick &+= 1
             lastInputAt = ProcessInfo.processInfo.systemUptime
+            lastKeyEventAt = info.timestamp > 0 ? Double(info.timestamp) / 1_000_000_000 : lastInputAt
         }
-        let caps = event.flags.contains(.maskAlphaShift)
+        let caps = info.flags.contains(.maskAlphaShift)
         if caps != capsOn {
             capsOn = caps
             DispatchQueue.main.async {
@@ -1289,21 +1544,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         switch type {
         case .flagsChanged where keycode == 63:  // Fn/Globe
             if shiftDown { shiftUsedAsModifier = true }
-            let pressed = event.flags.contains(.maskSecondaryFn)
-            if pressed && !fnDown {
+            // Длительность считаем по времени самих событий: если главный
+            // поток был занят, по своим часам короткий тап выглядел долгим
+            let at = info.timestamp > 0 ? Double(info.timestamp) / 1_000_000_000
+                                        : ProcessInfo.processInfo.systemUptime
+            let pressed = info.flags.contains(.maskSecondaryFn)
+            if pressed {
+                // Повторное «нажато» без «отпущено» бывает, когда отпускание
+                // прошло мимо нас. Считаем это новым нажатием, а не залипанием
                 fnDown = true
                 fnUsedAsModifier = false
-                fnDownAt = ProcessInfo.processInfo.systemUptime
-            } else if !pressed && fnDown {
+                fnDownAt = at
+            } else if fnDown {
                 fnDown = false
-                let held = ProcessInfo.processInfo.systemUptime - fnDownAt
-                if Settings.shared.fnSwitch && !fnUsedAsModifier && held < maxFnTap {
-                    DispatchQueue.main.async { self.toggleLayout() }
+                let held = at - fnDownAt
+                guard Settings.shared.fnSwitch else { break }
+                if fnUsedAsModifier {
+                    // Fn со стрелками и Backspace — обычная работа, в журнал
+                    // переключений это не пишем, чтобы не вытеснять важное
+                    log("Fn: не переключаю, вместе с ней нажимались другие клавиши")
+                } else if held >= maxFnTap {
+                    noteSwitch(String(format: "Fn: не переключаю, клавишу держали %.2f с (тап короче %.1f с)", held, maxFnTap))
+                } else {
+                    toggleLayout()
                 }
             }
         case .flagsChanged where keycode == 56 || keycode == 60:  // Shift
             if fnDown { fnUsedAsModifier = true }
-            let pressed = event.flags.contains(.maskShift)
+            let pressed = info.flags.contains(.maskShift)
             if pressed && !shiftDown {
                 shiftDown = true
                 shiftUsedAsModifier = false
@@ -1318,7 +1586,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if fnDown { fnUsedAsModifier = true }
             if shiftDown { shiftUsedAsModifier = true }
             lastShiftTapAt = 0
-            trackKey(event: event, keycode: keycode)
+            trackKey(flags: info.flags, keycode: keycode)
         default:
             break
         }
@@ -1340,33 +1608,82 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func toggleLayout() {
         if let v = CFPreferencesCopyAppValue("AppleFnUsageType" as CFString,
                                              "com.apple.HIToolbox" as CFString) as? Int, v != 0 {
+            noteSwitch("Fn: не переключаю, в системе клавише Globe назначено действие (\(v)), нужно «Ничего не делать»")
             return
         }
         let list = enabledLayouts()
-        guard list.count > 1 else { return }
+        guard list.count > 1 else {
+            noteSwitch("Fn: в системе включена одна раскладка, переключать не на что")
+            return
+        }
         let current = currentLayoutFullID()
         let index = list.firstIndex(where: { sourceID($0) == current }) ?? 0
-        TISSelectInputSource(list[(index + 1) % list.count])
+        selectManually(list[(index + 1) % list.count], why: "Fn")
+    }
+
+    // Ручной выбор раскладки (Fn или меню) с проверкой результата: система
+    // изредка принимает запрос и не переключает. Раньше это было невидимо
+    func selectManually(_ source: TISInputSource, why: String, attempt: Int = 1) {
+        let wanted = sourceID(source)
+        let before = currentLayoutFullID()
+        func short(_ id: String) -> String { id.components(separatedBy: ".").last ?? id }
+        lastManualSwitchAt = ProcessInfo.processInfo.systemUptime
+        lastManualSwitchApp = frontApp?.bundleIdentifier
+        let status = TISSelectInputSource(source)
+        currentSourceCache = nil
+        otherSourceCache = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            let now = currentLayoutFullID()
+            if now == wanted {
+                if self.lastLayout != currentLayout() { self.apply(layout: currentLayout(), animated: true) }
+                self.rememberLayout()
+                self.rememberFieldLayout()
+                self.noteSwitch("\(why): \(short(before)) -> \(short(wanted))\(attempt > 1 ? " (со второй попытки)" : "")")
+            } else if attempt == 1 {
+                self.selectManually(source, why: why, attempt: 2)
+            } else {
+                self.noteSwitch("\(why): НЕ ПЕРЕКЛЮЧИЛОСЬ на \(short(wanted)), осталась \(short(now)), код системы \(status)")
+                self.showPill(text: "не переключилось", color: .systemRed)
+            }
+        }
+    }
+
+    @objc func selectLayoutItem(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String, let source = layout(withID: id) else { return }
+        selectManually(source, why: "меню")
+    }
+
+    @objc func openSwitchLog() {
+        let path = runtimeDirectory().appendingPathComponent("switch.log")
+        if !FileManager.default.fileExists(atPath: path.path) { try? "".write(to: path, atomically: true, encoding: .utf8) }
+        NSWorkspace.shared.open(path)
     }
 
     // MARK: Буфер слова и автоисправление
 
-    func trackKey(event: CGEvent, keycode: Int64) {
-        // Пока идёт замена, набранное копим отдельно: иначе наши backspace
-        // съедят эти буквы, и получится «рвер hb» вместо «сервер»
+    func trackKey(flags: CGEventFlags, keycode: Int64) {
+        // Замена уже решена, но это нажатие успело уйти в приложение раньше,
+        // чем перехват начал придерживать ввод. Оно уже в тексте: запоминаем,
+        // чтобы стереть вместе со словом и вернуть в новой раскладке
         if replaceInProgress {
-            if keycode == 51 {
-                if !typedAfterBoundary.isEmpty { typedAfterBoundary.removeLast() }
-            } else if let cur = cachedSource() {
-                let stroke = Stroke(keycode: CGKeyCode(keycode), shift: event.flags.contains(.maskShift),
-                                    caps: event.flags.contains(.maskAlphaShift))
+            if flags.contains(.maskCommand) || flags.contains(.maskControl) || flags.contains(.maskAlternate) { return }
+            switch keycode {
+            case 51:
+                // Стёрли либо букву хвоста, либо уже сам знак после слова
+                if !typedAfterBoundary.isEmpty { typedAfterBoundary.removeLast() } else { tailBackspaces += 1 }
+            case 36, 76, 48, 53, 117, 115, 116, 119, 121, 123, 124, 125, 126:
+                // Enter или стрелка: строка ушла, править её вслепую нельзя
+                replaceAborted = true
+            default:
+                guard let cur = cachedSource() else { break }
+                let stroke = Stroke(keycode: CGKeyCode(keycode), shift: flags.contains(.maskShift),
+                                    caps: flags.contains(.maskAlphaShift))
                 if translate([stroke], via: cur).count == 1 { typedAfterBoundary.append(stroke) }
             }
             return
         }
         guard Settings.shared.autoCorrect || Settings.shared.manualConvert else { return }
         if IsSecureEventInputEnabled() || secureFieldCached { wordBuffer.removeAll(); lastWord = nil; return }
-        let flags = event.flags
         if flags.contains(.maskCommand) || flags.contains(.maskControl) || flags.contains(.maskAlternate) {
             // Своё сочетание Cmd+Option+цифра буфер не сбрасывает:
             // иначе набранный ключ вставки стирается перед разворотом
@@ -1386,10 +1703,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 lastWord = word
                 lastWordTrailing = 1
                 typedAfterBoundary.removeAll()
-                if Settings.shared.autoCorrect {
-                    let pause = isTerminalLike(frontApp) ? terminalPause : 0
-                    DispatchQueue.main.asyncAfter(deadline: .now() + pause) { self.autoCorrect(word) }
-                }
+                // Решаем сразу, в этом же заходе: между пробелом и решением
+                // не должно разбираться ни одно нажатие, иначе счёт символов
+                // для стирания расходится с текстом
+                if Settings.shared.autoCorrect { autoCorrect(word) }
             } else if lastWord != nil {
                 lastWordTrailing = min(lastWordTrailing + 1, 4)
             }
@@ -1441,12 +1758,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     lastWord = word
                     lastWordTrailing = 1
                     typedAfterBoundary.removeAll()
-                    if Settings.shared.autoCorrect {
-                        let pause = isTerminalLike(frontApp) ? terminalPause : 0
-                        DispatchQueue.main.asyncAfter(deadline: .now() + pause) {
-                            self.autoCorrect(word, boundary: stroke)
-                        }
-                    }
+                    if Settings.shared.autoCorrect { autoCorrect(word, boundary: stroke) }
                 }
                 return
             }
@@ -1467,12 +1779,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             log("пропуск: исправление выключено в «\(frontApp?.localizedName ?? "?")»")
             return
         }
-        if isSecureFieldFocused() {
-            log("пропуск: поле для пароля")
-            wordBuffer.removeAll(); lastWord = nil
-            return
-        }
-
         let full = translate(word, via: cur)
         // В оболочке однобуквенные и двухбуквенные последовательности —
         // это флаги и аргументы, а не опечатки
@@ -1509,6 +1815,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 continue
             }
 
+            // Поле пароля проверяем только когда уже решили править: это
+            // несколько запросов к чужому приложению, и раньше они шли на
+            // каждое слово, затягивая решение и главный поток
+            if isSecureFieldFocused() {
+                log("пропуск: поле для пароля")
+                wordBuffer.removeAll(); lastWord = nil
+                return
+            }
             // Хвост знаков и сам знак-граница остаются как набраны:
             // вставляем текст целиком, поэтому переводить их в клавиши не нужно
             let tail = translate(Array(word.dropFirst(letters.count)), via: cur)
@@ -2253,10 +2567,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return false
     }
 
-    // Заменяет последние `count` символов текстом. Раньше здесь были backspace
-    // и посимвольная перепечатка — события уходили быстрее, чем приложение
-    // успевало их обработать, отсюда «ККОШКА» вместо «КОШКА». Выделение
-    // стрелками плюс одна вставка атомарны и от скорости не зависят.
+    func switchLayout(to source: TISInputSource) {
+        TISSelectInputSource(source)
+        currentSourceCache = source
+        otherSourceCache = nil
+    }
+
+    enum PasteOutcome {
+        case confirmed
+        case mismatch(String)
+        case unreadable
+    }
+
+    // Ждём, пока вставка дойдёт до поля. Где текст читается, выходим сразу,
+    // как только он совпал, а не через фиксированную четверть секунды
+    func awaitPaste(expected: String, limit: TimeInterval, poll: Bool) -> PasteOutcome {
+        let start = ProcessInfo.processInfo.systemUptime
+        var polling = poll && !expected.isEmpty
+        var slowAnswers = false
+        usleep(40000)
+        while ProcessInfo.processInfo.systemUptime - start < limit {
+            if polling {
+                let before = ProcessInfo.processInfo.systemUptime
+                let actual = DispatchQueue.main.sync { self.textBeforeCaret(expected.count) }
+                if actual == expected { return .confirmed }
+                // Приложение отвечает медленно: опрос только затянет замену,
+                // а клавиатура всё это время придержана
+                if ProcessInfo.processInfo.systemUptime - before > 0.1 {
+                    polling = false
+                    slowAnswers = true
+                }
+            }
+            usleep(25000)
+        }
+        guard !expected.isEmpty, !slowAnswers,
+              let actual = DispatchQueue.main.sync(execute: { self.textBeforeCaret(expected.count) }) else {
+            return .unreadable
+        }
+        return actual == expected ? .confirmed : .mismatch(actual)
+    }
+
+    // Заменяет последние `count` символов текстом: стираем и вставляем из
+    // буфера обмена. На всё это время перехват придерживает нажатия человека
+    // и отдаёт их приложению после вставки. Раньше они шли в текст сразу,
+    // в старой раскладке и вперемешку с нашими — отсюда «долго lb»,
+    // буква перед исправленным словом и слова, исправленные наполовину
     func replaceLast(_ count: Int, with text: String, switchTo target: TISInputSource?,
                      guardTick: Int? = nil, source: String = "авто") {
         guard ensureAccessibility() else { return }
@@ -2265,77 +2620,106 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         replaceInProgress = true
+        replaceAborted = false
+        tailBackspaces = 0
+        typedAfterBoundary.removeAll()
+        let heldBefore = gate.heldCount
+        // Сколько прошло от нажатия до решения и сколько займёт сама замена:
+        // по этим числам в журнале видно, где теряется время
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        let decisionMs = Int(max(0, min(startedAt - lastKeyEventAt, 9.999)) * 1000)
+        if tapIsActive { gate.begin(now: ProcessInfo.processInfo.systemUptime, limit: holdLimit) }
         // Страховка: если приложение не ответит, флаг не должен залипнуть навсегда
         let watchdog = DispatchWorkItem { [weak self] in
             guard let self, self.replaceInProgress else { return }
             self.replaceInProgress = false
+            self.typedAfterBoundary.removeAll()
+            self.drainHeld()
             self.log("замена: сброс по таймауту")
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: watchdog)
 
-        let pb = NSPasteboard.general
-        let saved = pb.string(forType: .string)
-        DispatchQueue.global(qos: .userInteractive).async {
-            func finish(_ note: String?) {
-                DispatchQueue.main.async {
-                    watchdog.cancel()
-                    if let note { self.log(note) }
-                    self.replaceInProgress = false
-                }
-            }
-            // Забираем то, что человек успел набрать после границы слова:
-            // эти буквы уже в тексте, и наши backspace их бы съели
-            // Хвост читаем в той раскладке, в которую переходим: человек
-            // уже печатал нужный язык, просто раскладка не успела смениться
-            func takeTyped() -> [Stroke] {
-                DispatchQueue.main.sync {
-                    let typed = self.typedAfterBoundary
-                    self.typedAfterBoundary.removeAll()
-                    return typed
-                }
-            }
-            let tailLayout = DispatchQueue.main.sync { target ?? currentSource() }
-            // По SSH эхо приходит с задержкой, поэтому в терминалах медленнее
-            let slow = DispatchQueue.main.sync { self.isTerminalLike(self.frontApp) }
-            func erase(_ amount: Int) {
-                guard amount > 0 else { return }
-                for _ in 0..<amount {
-                    self.postKey(51)
-                    if slow { usleep(12000) }
-                }
-                usleep(slow ? 160000 : 50000)
-            }
+        let saved = NSPasteboard.general.string(forType: .string)
+        // По SSH эхо приходит с задержкой, поэтому в терминалах медленнее
+        let slow = isTerminalLike(frontApp)
+        // Раскладку меняем сразу, а не после вставки: к моменту, когда
+        // придержанные нажатия вернутся приложению, она уже точно действует.
+        // Стирание и Cmd+V от раскладки не зависят
+        let tailLayout = target ?? currentSource()
+        if let target { switchLayout(to: target) }
 
-            var tail = takeTyped()
-            guard tail.count < 16 else { return finish("замена отменена: печать не останавливается") }
-            erase(count + tail.count)
-
-            // Пока стирали, могли добавиться ещё буквы — стираем и их,
-            // но вернём в конце вместе с исправленным словом
-            for _ in 0..<2 {
-                let extra = takeTyped()
-                guard !extra.isEmpty else { break }
-                tail += extra
-                erase(extra.count)
-            }
-
-            // Разбор раскладки — только с главного потока: системный вызов
-            // проверяет очередь и роняет процесс
-            let tailText: String = DispatchQueue.main.sync {
-                let result = tailLayout.map { translate(tail, via: $0) } ?? ""
-                self.writeClipboard(text + result)
-                return result
-            }
-            usleep(slow ? 90000 : 30000)
-            self.postKey(9, flags: .maskCommand)  // Cmd+V
-            usleep(slow ? 400000 : 260000)
-            DispatchQueue.main.async {
+        // Следующим заходом главной очереди: к нему уже разобраны все нажатия,
+        // которые проскочили в приложение до начала удержания (см. trackKey)
+        DispatchQueue.main.async {
+            func cancel(_ note: String) {
                 watchdog.cancel()
-                if let target { TISSelectInputSource(target) }
-                self.restoreClipboard(saved)
+                self.log(note)
                 self.replaceInProgress = false
                 self.typedAfterBoundary.removeAll()
-                self.verifyReplacement(expected: text + tailText, source: source, tick: self.inputTick)
+                self.drainHeld()
+            }
+            if self.replaceAborted { return cancel("замена отменена: строка ушла раньше, чем началась правка") }
+            let tail = self.typedAfterBoundary
+            self.typedAfterBoundary.removeAll()
+            guard tail.count < 16 else { return cancel("замена отменена: печать не останавливается") }
+            // Человек успел стереть знак после слова: не возвращаем его
+            let dropped = min(self.tailBackspaces, count, text.count)
+            let tailText = tailLayout.map { translate(tail, via: $0) } ?? ""
+            let expected = String(text.dropLast(dropped)) + tailText
+            let eraseCount = count - dropped + tail.count
+
+            DispatchQueue.global(qos: .userInteractive).async {
+                if eraseCount > 0 {
+                    for _ in 0..<eraseCount {
+                        self.postKey(51)
+                        if slow { usleep(12000) }
+                    }
+                    usleep(slow ? 160000 : 50000)
+                }
+                // Если перед курсором уже стоит ровно такой текст (тот же пресет
+                // второй раз), совпадение ничего не докажет: ждём полный срок,
+                // иначе буфер обмена вернётся раньше, чем приложение его прочтёт
+                let already: Bool = DispatchQueue.main.sync {
+                    self.writeClipboard(expected)
+                    return self.textBeforeCaret(expected.count) == expected
+                }
+                usleep(slow ? 90000 : 30000)
+                self.postKey(9, flags: .maskCommand)  // Cmd+V
+                let outcome = self.awaitPaste(expected: expected, limit: slow ? 0.4 : 0.26, poll: !already)
+                DispatchQueue.main.sync {
+                    watchdog.cancel()
+                    self.restoreClipboard(saved)
+                    self.typedAfterBoundary.removeAll()
+                    // Хвост уже в тексте в новой раскладке и начинает следующее
+                    // слово: без этого оно попадало в буфер без первых букв
+                    // и чинилось наполовину («как» -> «кfr»)
+                    if !tail.isEmpty {
+                        self.wordBuffer = strokesAfterLastSpace(tail)
+                        self.lineStrokes.append(contentsOf: tail)
+                        if self.lineStrokes.count > maxLineLength {
+                            self.lineStrokes.removeFirst(self.lineStrokes.count - maxLineLength)
+                        }
+                    }
+                    self.replaceInProgress = false
+                    let held = self.gate.heldCount - heldBefore
+                    let shown = expected.trimmingCharacters(in: .whitespaces)
+                    let totalMs = Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000)
+                    let note = (tail.isEmpty ? "" : ", с хвостом из \(tail.count)")
+                        + (held > 0 ? ", придержано нажатий: \(held)" : "")
+                        + ", решение \(decisionMs) мс, замена \(totalMs) мс"
+                    switch outcome {
+                    case .confirmed:
+                        self.recordCorrection("[\(source)] «\(shown)» — заменено\(note)")
+                    case .unreadable:
+                        self.recordCorrection("[\(source)] «\(shown)» — проверить не удалось\(note)")
+                    case .mismatch(let actual):
+                        self.log("замена не подтвердилась: ожидалось «\(expected)», в тексте «\(actual)»")
+                        self.recordCorrection("[\(source)] «\(shown)» — НЕ УДАЛОСЬ, в тексте «\(actual)»\(note)")
+                        self.showPill(text: "не удалось", color: .systemRed)
+                    }
+                }
+                // Только теперь отдаём приложению то, что человек набрал за время замены
+                self.drainHeld()
             }
         }
     }
@@ -2357,32 +2741,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 element, kAXStringForRangeParameterizedAttribute as CFString, value, &textRef) == .success,
               let text = textRef as? String else { return nil }
         return text
-    }
-
-    // Приложение могло проглотить наши нажатия и промолчать — раньше такие
-    // сбои были невидимы и выглядели как «иногда не срабатывает»
-    func verifyReplacement(expected: String, source: String = "авто", tick: Int = 0) {
-        guard !expected.isEmpty else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            // Если человек уже набрал что-то после замены, текст перед
-            // курсором принадлежит ему, и сверять его бессмысленно:
-            // раньше это давало ложные «НЕ УДАЛОСЬ»
-            guard self.inputTick == tick else {
-                self.recordCorrection("[\(source)] «\(expected.trimmingCharacters(in: .whitespaces))» — набор продолжился, не проверяю")
-                return
-            }
-            guard let actual = self.textBeforeCaret(expected.count) else {
-                self.recordCorrection("[\(source)] «\(expected.trimmingCharacters(in: .whitespaces))» — проверить не удалось")
-                return
-            }
-            if actual == expected {
-                self.recordCorrection("[\(source)] «\(expected.trimmingCharacters(in: .whitespaces))» — заменено")
-            } else {
-                self.log("замена не подтвердилась: ожидалось «\(expected)», в тексте «\(actual)»")
-                self.recordCorrection("[\(source)] «\(expected.trimmingCharacters(in: .whitespaces))» — НЕ УДАЛОСЬ, в тексте «\(actual)»")
-                self.showPill(text: "не удалось", color: .systemRed)
-            }
-        }
     }
 
     // Помечаем содержимое временным: менеджеры буфера обмена (Raycast,
@@ -2586,6 +2944,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState,
                                                                eventType: .init(rawValue: ~0)!)
             guard idle > 45, !self.replaceInProgress else { return }
+            // Без разрешений самопроверка заведомо провалится и откатит
+            // обновление. Так бывает, когда новая сборка подписана другим
+            // сертификатом: ждём, пока человек выдаст доступ заново
+            guard AXIsProcessTrusted(), self.tapIsActive else { return }
             self.verifyArmed = false
             timer.invalidate()
             self.runSelfCheck()

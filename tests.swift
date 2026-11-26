@@ -197,5 +197,44 @@ if let ru = layouts.first(where: { sourceLang($0).hasPrefix("ru") }),
     print("пропуск тестов карты: нужны русская и английская раскладки")
 }
 
+// Удержание ввода на время замены
+do {
+    func key(_ code: Int64, down: Bool = true) -> HeldKey {
+        HeldKey(keycode: code, flags: 0, down: down, autorepeat: false)
+    }
+    let gate = InputGate()
+    var passedCount = 0
+    check(gate.offer(key(1), now: 0, passed: { passedCount += 1 }) == .pass, "без удержания нажатие проходит")
+    check(passedCount == 1, "пропущенное нажатие сообщается разборщику")
+    gate.begin(now: 10, limit: 2)
+    check(gate.isHolding, "удержание включено")
+    check(gate.offer(key(1, down: false), now: 10.01) == .pass,
+          "отпускание клавиши, нажатой до удержания, проходит")
+    check(gate.offer(key(2), now: 10.1, passed: { passedCount += 1 }) == .hold, "нажатие во время замены удержано")
+    check(passedCount == 1, "удержанное нажатие разборщику не сообщается")
+    check(gate.offer(key(2, down: false), now: 10.12) == .hold, "его отпускание тоже удержано")
+    check(gate.offer(key(3), now: 10.2) == .hold, "второе нажатие удержано")
+    let first = gate.takeOrRelease()
+    check(first.map { $0.keycode } == [2, 2, 3] && first.map { $0.down } == [true, false, true],
+          "удержанное отдаётся в порядке набора")
+    check(gate.isHolding, "пока есть что отдавать, удержание не снимается")
+    check(gate.offer(key(4), now: 10.3) == .hold, "нажатие во время доигрывания тоже ждёт очереди")
+    check(gate.takeOrRelease().map { $0.keycode } == [4], "и отдаётся следующим заходом")
+    check(gate.takeOrRelease().isEmpty && !gate.isHolding, "пустой заход снимает удержание")
+    check(gate.offer(key(5), now: 10.4) == .pass, "после снятия нажатия идут как обычно")
+
+    gate.begin(now: 20, limit: 2)
+    check(gate.offer(key(6), now: 23) == .holdExpired, "просроченное удержание сообщает о себе")
+    check(gate.takeOrRelease().map { $0.keycode } == [6], "и ничего не теряет")
+    _ = gate.takeOrRelease()
+
+    let space = Stroke(keycode: 49, shift: false, caps: false)
+    let a = Stroke(keycode: 0, shift: false, caps: false)
+    let b = Stroke(keycode: 11, shift: false, caps: false)
+    check(strokesAfterLastSpace([a, b]).count == 2, "хвост без пробела — начало слова целиком")
+    check(strokesAfterLastSpace([a, space, b]).map { $0.keycode } == [11], "после пробела — только новое слово")
+    check(strokesAfterLastSpace([a, space]).isEmpty, "хвост кончился пробелом — слово не начато")
+}
+
 print(failures == 0 ? "Все тесты пройдены: \(checks)" : "Провалено \(failures) из \(checks)")
 exit(failures == 0 ? 0 : 1)

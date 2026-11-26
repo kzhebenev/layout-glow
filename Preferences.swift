@@ -341,6 +341,8 @@ final class PreferencesWindow: NSObject, NSTableViewDataSource, NSTableViewDeleg
             button("История исправлений", #selector(openCorrections)),
             button("Очистить историю буфера обмена", #selector(clearClipboard)),
             button("Журнал состояния", #selector(openStatus)),
+            button("Журнал переключений раскладки", #selector(openSwitchLog)),
+            button("Перезапустить перехват клавиатуры", #selector(restartTap)),
             button("Разрешения системы", #selector(openPermissions)),
             button("Выдать разрешения заново", #selector(repairPermissions)),
         ])
@@ -363,6 +365,9 @@ final class PreferencesWindow: NSObject, NSTableViewDataSource, NSTableViewDeleg
         done.messageText = "История буфера обмена очищена"
         done.runModal()
     }
+    @objc private func openSwitchLog() { delegate.openSwitchLog() }
+    @objc private func restartTap() { delegate.restartTapFromMenu() }
+
     @objc private func openStatus() {
         NSWorkspace.shared.open(runtimeDirectory().appendingPathComponent("status.log"))
     }
